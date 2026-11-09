@@ -124,11 +124,15 @@ extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_retur
 extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVRMFB, "0.1", _start, _stop) }
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
-static inline void nvu_zero(void *p, size_t n) { __asm__ __volatile__("rep stosb" : "+D"(p), "+c"(n) : "a"(0) : "memory"); }
-static inline void nvu_copy(void *d, const void *s, size_t n) { __asm__ __volatile__("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory"); }
+static inline void nvu_zero(void *p, size_t n) { nv_xnu_memset(p, 0, n); }
+static inline void nvu_copy(void *d, const void *s, size_t n) { nv_xnu_memcpy(d, s, n); }
 // Clears freshly granted VRAM through its BAR1 mapping. Byte stores are the slow case there: on an RTX 3070 Laptop a byte-wise clear of an
 // 8 MB grant took ~180 ms with WindowServer waiting on it; 8-byte stores do the same job with 8x fewer PCIe writes (~20 ms).
+#if NV_XNU_X86
 static inline void nvu_zero_wide(void *p, size_t n) { size_t q = n >> 3; __asm__ __volatile__("rep stosq" : "+D"(p), "+c"(q) : "a"(0ull) : "memory"); nvu_zero(p, n & 7); }
+#else
+static inline void nvu_zero_wide(void *p, size_t n) { nv_xnu_memset(p, 0, n); }   // 8-byte stores when aligned (nv-xnu-arch.h)
+#endif
 #define FBTRACE(buf) do { trace(buf); } while (0)
 #define FBSEL(a) char _s[5] = { (char)((a) >> 24), (char)((a) >> 16), (char)((a) >> 8), (char)(a), 0 }
 #define FBLOG(fmt, ...) do { IOLog("NVRM-fb: " fmt "\n", ##__VA_ARGS__); kprintf("NVRM-fb: " fmt "\n", ##__VA_ARGS__); \
@@ -2369,7 +2373,7 @@ IOReturn NVRMNVDAFramebuffer::setCursorImageLocked(void *cursorImage)
         if (++refused <= 4) FBLOG("cursor conversion declined %u (discovery or unsupported image)", refused);
         return kIOReturnUnsupported;
     }
-    __asm__ __volatile__("sfence" ::: "memory");
+    nv_xnu_wc_flush();
     fCurHaveImage = true;
     static unsigned images;
     if (++images <= 4) FBLOG("K8 cursor image %u: %ux%u hot %u,%u plane %u",
@@ -3517,7 +3521,7 @@ bool NVRMNVDAFramebuffer::verifyAperture(NvU64 phys, const char *label)
     volatile UInt32 *k = (volatile UInt32 *)fKva;
     k[0x1000 / 4] = SIG1;
     k[0x2000 / 4] = SIG2;
-    __asm__ volatile("mfence" ::: "memory");
+    nv_xnu_full_barrier();
     if (k[0x1000 / 4] != SIG1 || k[0x2000 / 4] != SIG2) {
         FBLOG("verifyAperture(%s): CONTROL FAILED -- the write never landed through fKva; "
               "the readback says nothing about the address", label);

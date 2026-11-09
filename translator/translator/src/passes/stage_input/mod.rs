@@ -2596,6 +2596,11 @@ fn register_embedded_textures(
             let unrouted = ctx.emit_sidecar.buffer_pointer_field_loads.iter().any(|f| {
                 f.root == buffer_root && f.byte_offset == off && !heap_ids.contains(&f.id)
             });
+            if std::env::var_os("METAL2VULKAN_TEXFIELD_DBG").is_some() {
+                eprintln!("[texfield-dbg] buffer root {buffer_root} field off {off}: heap_ids {heap_ids:?} unrouted {unrouted} | heap loads {:?} | field loads {:?}",
+                    ctx.emit_sidecar.buffer_pointer_heap_loads.iter().map(|f| (f.id, f.root, f.byte_offset, f.slot)).collect::<Vec<_>>(),
+                    ctx.emit_sidecar.buffer_pointer_field_loads.iter().map(|f| (f.id, f.root, f.byte_offset)).collect::<Vec<_>>());
+            }
             if !heap_ids.is_empty() && !unrouted {
                 let heap = bindless_heap_var(ctx, image_ty, (tex.dim, tex.arrayed), tex.comp);
                 let facts: Vec<crate::emit_sidecar::BufferPointerHeapLoad> = ctx

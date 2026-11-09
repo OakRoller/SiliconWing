@@ -17,6 +17,11 @@
 #include <libkern/c++/OSData.h>
 #include <pexpert/pexpert.h>
 
+#include "nv-xnu-arch.h"
+// Apple Silicon: the card is never the boot display (an eGPU cannot be, and the Mac always has its own panel), so a
+// start that does not light a head is not a black screen. The guard would only switch the driver off after two failed
+// bring-ups and let the installer's fallback job put the previous build back, mid-debugging (2026-11-03). Off there;
+// -nvoff and nullmoth-remove still work.
 #define NVRM_GUARD_VAR "nullmoth-nv-starts"
 #define NVRM_GUARD_OK_VAR "nullmoth-nv-ok"
 #define NVRM_GUARD_LIMIT 2
@@ -39,7 +44,7 @@ static inline bool nvrm_driver_off(void)
     if (!options)
         return false;  // NVRAM not published yet: the boot-arg alone decides, as before
     OSObject *flag = options->copyProperty("nullmoth-remove");
-    const bool guard = nvrm_guard_starts(options) >= NVRM_GUARD_LIMIT;
+    const bool guard = !NV_XNU_ARM64 && nvrm_guard_starts(options) >= NVRM_GUARD_LIMIT;
     options->release();
     if (flag) { flag->release(); return true; }
     return guard;
@@ -56,6 +61,7 @@ static thread_t gNvrmGuardPauseOwner;     // the worker that claimed the pause: 
 static inline void nvrm_guard_count_start(void)
 {
     static bool counted;
+    if (NV_XNU_ARM64) return;
     if (counted) return;
     counted = true;
     IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);

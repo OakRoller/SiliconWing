@@ -16,8 +16,8 @@ extern "C" {
 #include "nvUnixVersion.h"
 }
 
-static inline void nvu_memset(void *p, int c, size_t n) { __asm__ __volatile__("rep stosb" : "+D"(p), "+c"(n) : "a"(c) : "memory"); }
-static inline void nvu_memcpy(void *d, const void *s, size_t n) { __asm__ __volatile__("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory"); }
+static inline void nvu_memset(void *p, int c, size_t n) { nv_xnu_memset(p, c, n); }
+static inline void nvu_memcpy(void *d, const void *s, size_t n) { nv_xnu_memcpy(d, s, n); }
 extern "C" nv_state_t *nv_xnu_gpu_state(void);
 extern "C" void *nv_xnu_gpu_os_device(void);
 

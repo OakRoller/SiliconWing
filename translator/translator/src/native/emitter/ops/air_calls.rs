@@ -15,10 +15,21 @@ impl Emitter {
                         call.args.len()
                     ));
                 }
-                let execution = air_barrier_execution_scope(call)?;
+                let stated = air_barrier_execution_scope(call)?;
+                // simdgroup_barrier synchronizes one simdgroup whatever its last operand says: Metal Shader Converter
+                // emits air.simdgroup.barrier(flags, 1) with 1 naming the threadgroup *memory* scope. Lowered as a
+                // workgroup control barrier, one inside a branch only some threads take (Cyberpunk 2077's light
+                // culling: thread 0 publishes the list offset) met the other warps' later workgroup barrier on
+                // NVIDIA's shared barrier 0 and released them before the offset was written; they read stale
+                // threadgroup memory and wrote the light list gigabytes away (GPU channel MMU fault, 2026-11-05).
+                let execution = if call.callee == "air.simdgroup.barrier" {
+                    Scope::Subgroup
+                } else {
+                    stated
+                };
                 let scope = self.const_uint(execution as u32)?;
                 let memory_scope =
-                    self.const_uint(air_barrier_memory_scope(call, execution) as u32)?;
+                    self.const_uint(air_barrier_memory_scope(call, stated) as u32)?;
                 let semantics = self.const_uint(air_barrier_memory_semantics(call).bits())?;
                 instructions.push(Self::inst(
                     Op::ControlBarrier,
@@ -98,9 +109,9 @@ impl Emitter {
                 Ok(true)
             }
             "air.atomic.local.store.i32" | "air.atomic.global.store.i32" => {
-                if call.args.len() != 5 {
+                if call.args.len() != 5 && call.args.len() != 6 {
                     return Err(format!(
-                        "native emitter: {} expects 5 operands",
+                        "native emitter: {} expects 5 or 6 operands",
                         call.callee
                     ));
                 }
@@ -315,9 +326,9 @@ impl Emitter {
                 Ok(true)
             }
             "air.atomic.local.load.i32" | "air.atomic.global.load.i32" => {
-                if call.args.len() != 4 {
+                if call.args.len() != 4 && call.args.len() != 5 {
                     return Err(format!(
-                        "native emitter: {} expects 4 operands",
+                        "native emitter: {} expects 4 or 5 operands",
                         call.callee
                     ));
                 }
@@ -349,9 +360,9 @@ impl Emitter {
                 Ok(true)
             }
             "air.atomic.global.add.f32" => {
-                if call.args.len() != 5 {
+                if call.args.len() != 5 && call.args.len() != 6 {
                     return Err(format!(
-                        "native emitter: {} expects 5 operands",
+                        "native emitter: {} expects 5 or 6 operands",
                         call.callee
                     ));
                 }
@@ -385,9 +396,9 @@ impl Emitter {
                 Ok(true)
             }
             "air.atomic.global.sub.f32" => {
-                if call.args.len() != 5 {
+                if call.args.len() != 5 && call.args.len() != 6 {
                     return Err(format!(
-                        "native emitter: {} expects 5 operands",
+                        "native emitter: {} expects 5 or 6 operands",
                         call.callee
                     ));
                 }
@@ -428,9 +439,9 @@ impl Emitter {
                 Ok(true)
             }
             "air.atomic.local.cmpxchg.weak.i32" | "air.atomic.global.cmpxchg.weak.i32" => {
-                if call.args.len() != 7 {
+                if call.args.len() != 7 && call.args.len() != 8 {
                     return Err(format!(
-                        "native emitter: {} expects 7 operands",
+                        "native emitter: {} expects 7 or 8 operands",
                         call.callee
                     ));
                 }
@@ -505,9 +516,9 @@ impl Emitter {
     ) -> Result<(), String> {
         let (op, width) = crate::air_intrinsics::integer_atomic_rmw(&call.callee)
             .ok_or("native emitter: missing integer atomic ABI")?;
-        if call.args.len() != 5 {
+        if call.args.len() != 5 && call.args.len() != 6 {
             return Err(format!(
-                "native emitter: {} expects 5 operands",
+                "native emitter: {} expects 5 or 6 operands",
                 call.callee
             ));
         }

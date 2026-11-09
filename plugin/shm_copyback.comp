@@ -1,0 +1,44 @@
+// shmirror copy-back (notes item 66): run at the end of every submission part that may have written twinned (VRAM-mirrored
+// Shared) memory. One workgroup per 512 KB granule (x) of each table entry (y): a granule whose summary bit is clear is
+// skipped; otherwise every 4-byte chunk marked in the bitmap is copied from the VRAM copy (base) to the system pages
+// (shadow) and its bit cleared. Table layout: see translator/wrapper/src/store_note.rs.
+// Build: glslangValidator --target-env vulkan1.2 -V shm_copyback.comp --vn shm_copyback_spv -o shm_copyback.spv.h
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer V4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Entry { uint64_t base, len, bitmap, summary, shadow, touched; };
+layout(push_constant) uniform PC { uint64_t table; uint entries; uint pad; } pc;
+void main() {
+    const uint e = gl_WorkGroupID.y;
+    if (e >= pc.entries) return;
+    Entry E = Entry(pc.table + 4096ul + uint64_t(e) * 64ul);
+    const uint64_t len = E.len;
+    if (len == 0ul) return;                                   // a free entry
+    if (E.shadow == 0ul) return;                              // no system pages to copy to (diagnostic: copy-back off for this entry)
+    const uint g = gl_WorkGroupID.x;
+    const uint chunks = uint(len >> 2), words = (chunks + 31u) >> 5;   // 4-byte chunks, 32-bit indices: entries up to 16 GB
+    if (g * 131072u >= chunks) return;                        // past this entry's last granule
+    U32 S = U32(E.summary);
+    if ((S.v[g >> 5] & (1u << (g & 31u))) == 0u) return;     // nothing written here
+    U32 B = U32(E.bitmap); U32 src = U32(E.base), dst = U32(E.shadow);
+    for (uint k = gl_LocalInvocationID.x; k < 4096u; k += 64u) {
+        const uint w = g * 4096u + k;
+        if (w >= words) break;
+        uint bits = B.v[w];
+        if (bits == 0u) continue;
+        B.v[w] = 0u;
+        // the page is GPU-written from now on: the plugin uploads it whole after the writers (NVMTL_SHM_DIFF), so mark it
+        // before its bytes reach the system pages (the plugin re-reads the mark after diffing)
+        if (E.touched != 0ul) { U32 T = U32(E.touched); T.v[w >> 7u] = 1u; memoryBarrierBuffer(); }
+        while (bits != 0u) {
+            const uint b = findLSB(bits); bits &= bits - 1u;
+            const uint c = w * 32u + b;
+            dst.v[c] = src.v[c];
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) atomicAnd(S.v[g >> 5], ~(1u << (g & 31u)));
+}

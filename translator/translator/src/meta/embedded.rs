@@ -109,11 +109,26 @@ pub(super) fn detect_embedded_samplers(
 }
 
 pub(super) fn body_uses_texture_intrinsic(ll: &str) -> bool {
+    // A body that only queries a texture (get_width/get_height/get_depth/get_array_size/get_num_mip_levels/
+    // get_num_samples, is_null_texture, calculate_*_lod, texture atomics) still needs its embedded textures
+    // surfaced: without them the query's operand resolves to nothing and lowers to a constant 0 (texsim 30a,
+    // 2026-11-04: get_width/get_height/get_array_size through a resource ID read 0 while sampling the same texture worked).
     ll.contains("@air.sample_")
         || ll.contains("@air.gather_")
         || ll.contains("@air.read_texture")
+        || ll.contains("@air.read_depth")
         || ll.contains("@air.write_texture")
         || ll.contains("@air.write_imageblock_slice_to_texture")
+        || ll.contains("@air.get_width_")
+        || ll.contains("@air.get_height_")
+        || ll.contains("@air.get_depth_")
+        || ll.contains("@air.get_array_size_")
+        || ll.contains("@air.get_num_mip_levels_")
+        || ll.contains("@air.get_num_samples_")
+        || ll.contains("@air.is_null_texture")
+        || ll.contains("@air.calculate_unclamped_lod_")
+        || ll.contains("@air.calculate_clamped_lod_")
+        || ll.contains("@air.atomic_fetch_")
 }
 
 pub(super) fn detect_embedded_textures(

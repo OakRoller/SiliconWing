@@ -2,6 +2,49 @@ use super::super::ops::{bfloat_lanes, shaped_type};
 use super::*;
 
 impl Emitter {
+    fn emit_argument_buffer_sampler_phi(
+        &mut self,
+        name: &str,
+        incoming: &[(LlValue, String)],
+        result_ty: &LlType,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if !matches!(result_ty, LlType::Ptr(2))
+            || !crate::argument_buffer_samplers_on()
+            || !crate::reflect::bindless_fixed_fields_on()
+            || incoming.is_empty()
+            || !incoming.iter().all(|(value, _)| {
+                matches!(value, LlValue::Local(source) if super::super::functions::names_contain(&self.sampler_slot_sources, source))
+            })
+        {
+            return Ok(false);
+        }
+        let int_ty = LlType::Int(32);
+        let u32_ty = self.type_id(&int_ty)?;
+        let mut ops = Vec::new();
+        for (value, label) in incoming {
+            let LlValue::Local(source) = value else {
+                return Ok(false);
+            };
+            let source_slot =
+                self.result_id(&super::super::functions::sampler_slot_name(source), &int_ty)?;
+            ops.push(Operand::IdRef(source_slot));
+            ops.push(Operand::IdRef(self.label_id(label)?));
+        }
+        let slot = self.result_id(&super::super::functions::sampler_slot_name(name), &int_ty)?;
+        instructions.push(Self::inst(Op::Phi, Some(u32_ty), Some(slot), ops));
+        let result = self.result_id(name, result_ty)?;
+        self.sampler_slot_sources.insert(name.to_string());
+        self.emit_sidecar
+            .device_handle_heap_loads
+            .push(crate::emit_sidecar::DeviceHandleHeapLoad {
+                id: result,
+                slot,
+                sampler: true,
+            });
+        Ok(true)
+    }
+
     pub(in crate::native::emitter) fn emit_phi_resolved(
         &mut self,
         name: String,
@@ -18,6 +61,9 @@ impl Emitter {
         } else {
             parsed_incoming
         };
+        if self.emit_argument_buffer_sampler_phi(&name, &incoming, &result_ty, instructions)? {
+            return Ok(());
+        }
         if self.emit_selected_access_tree_phi(&name, &incoming, &result_ty, instructions)? {
             return Ok(());
         }

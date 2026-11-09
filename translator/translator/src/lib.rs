@@ -548,7 +548,12 @@ pub fn specialize_runtime_table_module(
         v.dedup();
         v
     };
+    let mut indices = indices;
+    if indices.is_empty() && san_ll.contains("@air.get_function_pointer_visible_function_table(") {
+        indices.push(linked_functions::AMBIENT_TABLE_PARAMETER);
+    }
     let rewritten = linked_functions::rewrite_runtime_table_lookups(san_ll, &entry_name, &indices)?;
+    let rewritten = ift_runtime::materialize_acceleration_structure_loads(&rewritten);
     let rewritten =
         ift_runtime::rewrite_runtime_intersection_tables(&rewritten, &entry_name, candidates)?;
     let entries: Vec<linked_functions::LinkedFunction> = candidates
@@ -842,12 +847,46 @@ pub fn translate_native_no_retry_constructed_with_options(
     // the inlined module validated and rendered black, the raw one lit the scene as the reference GPU does
     if raw_buffers_first_on() {
         if let Ok(finished) = rc.construct_raw() {
-            return Ok(finished.bytes);
+            // but not a raw construction that lost texture operations: the Metal Shader Converter shaders of Cyberpunk
+            // 2077 read their textures through descriptor-table pointers the raw construction cannot type, and came out
+            // of this branch as stubs sampling nothing (black G-buffer and UI, 2026-11-04); the typed primary of the
+            // same retry keeps every sample, so it is preferred whenever the raw module dropped any
+            let air_ops = air_texture_call_count(san_ll);
+            let raw_ops = module_image_op_count(&finished.module);
+            let primary_addresses = primary
+                .as_ref()
+                .map(|typed| module_device_address_count(&typed.module))
+                .unwrap_or(0);
+            let raw_lost_addresses =
+                primary_addresses > 0 && module_device_address_count(&finished.module) == 0;
+            if (raw_ops >= air_ops && !raw_lost_addresses) || primary.is_err() {
+                if let (Err(typed_err), true) = (&primary, env_vars::retry_debug()) {
+                    eprintln!("[raw-used] raw-first module kept because the typed primary failed: {typed_err}");
+                }
+                return Ok(finished.bytes);
+            }
+            if raw_lost_addresses && env_vars::retry_debug() {
+                eprintln!("[retry-debug] raw-first construction dropped all {primary_addresses} device-address access(es); using the typed primary instead");
+            }
+            if env_vars::retry_debug() {
+                eprintln!("[retry-debug] raw-first construction kept {raw_ops} of {air_ops} texture operation(s); using the typed primary instead");
+            }
         }
     }
     let constructed = match primary {
         Ok(finished) => finished,
+        // see translate_sanitized_with_meta_prevalidated_carrier: a sampler-heap-retryable failure must reach the
+        // wrapper's retry, not be hidden by a raw construction that drops the sample (Cyberpunk 2077, 2026-11-04)
+        Err(emit_err) if rc.needs_raw_construction() && argument_buffer_sampler_retry_handles(&emit_err) => {
+            if env_vars::retry_debug() {
+                eprintln!("[retry-debug] primary emission FAILED with a sampler-heap-retryable error; NOT constructing raw: {emit_err}");
+            }
+            return Err(emit_err);
+        }
         Err(emit_err) if rc.needs_raw_construction() => {
+            if env_vars::retry_debug() {
+                eprintln!("[raw-used] raw construction after the typed primary failed: {emit_err}");
+            }
             rc.construct_raw().map_err(|construction_error| {
                 format!("{emit_err}; raw construction failed: {construction_error}")
             })?
@@ -1341,8 +1380,50 @@ fn translate_sanitized_with_meta_prevalidated_carrier(
         }
     };
     let translated = match primary_finished {
+        // A primary that "succeeded" with fewer image operations than the AIR has texture calls dropped samples
+        // silently (an operand it could not resolve lowers to a null result): texsim 23b, a device-space struct holding
+        // a constant-space pointer to a descriptor table, came out with no sample at all (2026-11-04). The raw
+        // construction types such chains; it is taken when it keeps more of the texture operations.
+        Ok(finished)
+            if rc.needs_raw_construction()
+                && module_image_op_count(&finished.module) < air_texture_call_count(san_ll) =>
+        {
+            let primary_ops = module_image_op_count(&finished.module);
+            let air_ops = air_texture_call_count(san_ll);
+            match rc.construct_raw() {
+                Ok(raw) if module_image_op_count(&raw.module) > primary_ops => {
+                    if retry_debug_on {
+                        eprintln!("[retry-debug] primary kept {primary_ops} of {air_ops} texture operation(s); raw construction keeps {}: using raw",
+                                  module_image_op_count(&raw.module));
+                    }
+                    Ok(raw)
+                }
+                other => {
+                    if retry_debug_on {
+                        eprintln!("[retry-debug] primary kept {primary_ops} of {air_ops} texture operation(s); raw construction {} - keeping the primary",
+                                  match &other { Ok(raw) => format!("keeps {}", module_image_op_count(&raw.module)), Err(e) => format!("failed: {e}") });
+                    }
+                    Ok(finished)
+                }
+            }
+        }
         Ok(finished) => Ok(finished),
+        // A sampler read out of an argument buffer the emitter could not type ("sampler operand is not a sampler") is
+        // what the wrapper's retry with argument-buffer samplers fixes; the raw construction would instead succeed with
+        // every such sample dropped (its result a null constant) and the retry would never run. Cyberpunk 2077's Metal
+        // Shader Converter fragment shaders came out that way: G-buffer albedo and the whole UI sampled nothing and
+        // rendered black (2026-11-04). So the error goes up first; the retry's own primary failure still gets the raw
+        // construction below, as before.
+        Err(emit_err) if rc.needs_raw_construction() && argument_buffer_sampler_retry_handles(&emit_err) => {
+            if retry_debug_on {
+                eprintln!("[retry-debug] primary emission FAILED with a sampler-heap-retryable error; NOT constructing raw: {emit_err}");
+            }
+            Err(emit_err)
+        }
         Err(emit_err) if rc.needs_raw_construction() => {
+            if retry_debug_on {
+                eprintln!("[retry-debug] primary emission FAILED, falling back to raw construction: {emit_err}");
+            }
             let constructed = rc.construct_raw().map_err(|construction_error| {
                 format!("{emit_err}; raw construction failed: {construction_error}")
             })?;
@@ -1753,6 +1834,61 @@ pub fn inline_and_forward_object_fields(ll: &str) -> Option<String> {
 
 thread_local! {
     static ARGBUF_SAMPLERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Texture operations an AIR module performs: its calls to the sampling, reading and gathering intrinsics.
+pub(crate) fn air_texture_call_count(ll: &str) -> usize {
+    ll.lines()
+        .filter(|line| line.contains("call ") && (line.contains("@air.sample_") || line.contains("@air.read_") || line.contains("@air.gather")))
+        .count()
+}
+
+/// Image operations a SPIR-V module performs (samples, fetches, gathers, reads), to compare with the AIR's.
+pub(crate) fn module_device_address_count(module: &Module) -> usize {
+    module
+        .functions
+        .iter()
+        .flat_map(|function| function.blocks.iter())
+        .flat_map(|block| block.instructions.iter())
+        .filter(|inst| inst.class.opcode == spirv::Op::ConvertUToPtr)
+        .count()
+}
+
+pub(crate) fn module_image_op_count(module: &Module) -> usize {
+    use spirv::Op;
+    module
+        .functions
+        .iter()
+        .flat_map(|function| function.blocks.iter())
+        .flat_map(|block| block.instructions.iter())
+        .filter(|inst| {
+            matches!(
+                inst.class.opcode,
+                Op::ImageSampleImplicitLod
+                    | Op::ImageSampleExplicitLod
+                    | Op::ImageSampleDrefImplicitLod
+                    | Op::ImageSampleDrefExplicitLod
+                    | Op::ImageSampleProjImplicitLod
+                    | Op::ImageSampleProjExplicitLod
+                    | Op::ImageSampleProjDrefImplicitLod
+                    | Op::ImageSampleProjDrefExplicitLod
+                    | Op::ImageFetch
+                    | Op::ImageGather
+                    | Op::ImageDrefGather
+                    | Op::ImageRead
+            )
+        })
+        .count()
+}
+
+/// True for a primary-emission error the wrapper retries with argument-buffer samplers (translate_with_pointer_retry),
+/// while that retry has not run yet: such a module must fail rather than take the raw construction, which drops the
+/// sample instead of reporting it.
+pub(crate) fn argument_buffer_sampler_retry_handles(error: &str) -> bool {
+    !argument_buffer_samplers_on()
+        && (error.contains("sampler operand is not a sampler")
+            || error.contains("sampler operand is a pointer")
+            || error.contains("runtime sampler specialization cannot recover an exact state after pointer selection"))
 }
 
 /// Runs `f` with samplers held in argument buffers read through the sampler heap (the plugin's binding 1), as the retry of

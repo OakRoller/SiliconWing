@@ -2,6 +2,33 @@ use super::*;
 
 use crate::reflect::SamplerAddressMode;
 
+fn clamp_min_lod_to_levels(ctx: &mut Ctx, img: Word, clamp: Word, out: &mut Vec<Instruction>) -> Word {
+    ctx.add_capability(spirv::Capability::ImageQuery);
+    let uint = ctx.ty_uint();
+    let f = ctx.ty_float();
+    let glsl = ctx.glsl();
+    let one = ctx.const_float(1.0);
+    let levels = ctx.module.fresh_id();
+    out.push(Instruction::new(Op::ImageQueryLevels, Some(uint), Some(levels), vec![Operand::IdRef(img)]));
+    let levels_f = ctx.module.fresh_id();
+    out.push(Instruction::new(Op::ConvertUToF, Some(f), Some(levels_f), vec![Operand::IdRef(levels)]));
+    let last = ctx.module.fresh_id();
+    out.push(Instruction::new(Op::FSub, Some(f), Some(last), vec![Operand::IdRef(levels_f), Operand::IdRef(one)]));
+    let clamped = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ExtInst,
+        Some(f),
+        Some(clamped),
+        vec![
+            Operand::IdRef(glsl),
+            Operand::LiteralExtInstInteger(GLSLstd450::FMin as u32),
+            Operand::IdRef(clamp),
+            Operand::IdRef(last),
+        ],
+    ));
+    clamped
+}
+
 fn is_gradient_family(name: &str) -> bool {
     name.split('.').any(|token| token.ends_with("_grad"))
 }
@@ -376,8 +403,47 @@ pub(in crate::passes) fn lower_sample(
         _ => spatial.unwrap_or(0),
     };
     let grad3 = sample_gradient_pair(ctx, name, arrayed, args, gradient_lanes)?;
-    let min_lod = grad3.and_then(|(_, _, clamp)| clamp);
+    let mut min_lod = grad3.and_then(|(_, _, clamp)| clamp);
+    if let Some(clamp) = min_lod {
+        min_lod = Some(clamp_min_lod_to_levels(ctx, img, clamp, &mut out));
+    }
     let grad = grad3.map(|(dx, dy, _)| (dx, dy));
+    let mut level = if grad.is_some() {
+        None
+    } else {
+        find_sample_level(ctx, arrayed, args, &mut out)
+    };
+    if grad.is_none() {
+        if let Some(clamp) = find_sample_min_lod_clamp(ctx, arrayed, args) {
+            let clamp = clamp_min_lod_to_levels(ctx, img, clamp, &mut out);
+            let explicit = matches!(level, Some(SampleLevel::Explicit(_)))
+                || is_int_tex
+                || !matches!(ctx.stage, Stage::Fragment);
+            if explicit {
+                let base = match level {
+                    Some(SampleLevel::Explicit(lod)) => lod,
+                    _ => ctx.const_float(0.0),
+                };
+                let f = ctx.ty_float();
+                let glsl = ctx.glsl();
+                let id = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::ExtInst,
+                    Some(f),
+                    Some(id),
+                    vec![
+                        Operand::IdRef(glsl),
+                        Operand::LiteralExtInstInteger(GLSLstd450::FMax as u32),
+                        Operand::IdRef(base),
+                        Operand::IdRef(clamp),
+                    ],
+                ));
+                level = Some(SampleLevel::Explicit(id));
+            } else {
+                min_lod = Some(clamp);
+            }
+        }
+    }
     if min_lod.is_some() {
         let has = ctx.module.capabilities.iter().any(|inst| {
             matches!(
@@ -394,11 +460,6 @@ pub(in crate::passes) fn lower_sample(
             ));
         }
     }
-    let level = if grad.is_some() {
-        None
-    } else {
-        find_sample_level(ctx, arrayed, args, &mut out)
-    };
     let (const_offset, dynamic_offset) = if let Some(spatial) = spatial {
         let (const_offset, dynamic_offset) =
             sample_const_or_dynamic_offset(ctx, arrayed, args, spatial as u32)?;

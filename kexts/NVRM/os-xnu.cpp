@@ -20,8 +20,8 @@ extern "C" void nv_xnu_power_state(bool *acPlugged, bool *haveBattery);   // nv_
 
 #define NV_XNU_TRC do { static bool _t = false; if (!_t) { _t = true; kprintf("NVRM-xnu: >%s\n", __func__); } } while (0)
 
-static inline void nvx_memset(void *d, int c, size_t n) { __asm__ __volatile__("rep stosb" : "+D"(d), "+c"(n) : "a"(c) : "memory"); }
-static inline void nvx_memcpy(void *d, const void *s, size_t n) { __asm__ __volatile__("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory"); }
+static inline void nvx_memset(void *d, int c, size_t n) { nv_xnu_memset(d, c, n); }
+static inline void nvx_memcpy(void *d, const void *s, size_t n) { nv_xnu_memcpy(d, s, n); }
 
 extern "C" {
 
@@ -299,7 +299,7 @@ NV_STATUS NV_API_CALL os_pci_write_word(void *h, NvU32 off, NvU16 v)  { NV_XNU_T
 NV_STATUS NV_API_CALL os_pci_write_dword(void *h, NvU32 off, NvU32 v) { NV_XNU_TRC; NV_PCI_H(h); ((nv_xnu_pci_slot *)h)->pci->configWrite32(off, v); return NV_OK; }
 
 struct nv_xnu_map { IOMemoryDescriptor *md; IOMemoryMap *map; void *va; NvU64 phys; NvU64 size; void *alias; };
-extern "C" { void *nv_pm_alias(NvU64, NvU64, void **); void nv_pm_alias_drop(void *); bool nv_pm_is_gpu(NvU64, NvU64);
+extern "C" { void *nv_pm_alias(NvU64, NvU64, void **); void nv_pm_alias_drop(void *); bool nv_pm_is_gpu(NvU64, NvU64); bool nv_pm_is_gpu_aperture(NvU64, NvU64);
              void nv_pm_foreign(NvU64, NvU64, NvU32, void *); }
 // Every kernel mapping RM makes is tracked here (VA -> physical for the framebuffer's overlap and aperture checks).
 // WAS 1024: a resizable BAR1 has a 4 GB surface budget and the accelerator maps each allocation, so an RTX 3050 and
@@ -326,9 +326,22 @@ static inline void nv_xnu_map_publish(nv_xnu_map *m, IOMemoryDescriptor *md, IOM
     m->md = md; m->map = map; m->phys = phys; m->size = size; m->alias = alias;
     __atomic_store_n(&m->va, va, __ATOMIC_RELEASE);
 }
+extern "C" bool nv_xnu_keep_cached_map(void);   // os-xnu2.cpp: cacheable unless the nvrmdevmem=1 boot-arg opts into Device mappings
 void *NV_API_CALL os_map_kernel_space(NvU64 start, NvU64 size, NvU32 mode)
 {
     IOOptionBits cache = (mode == NV_MEMORY_CACHED) ? kIOMapDefaultCache : (mode == NV_MEMORY_WRITECOMBINED ? kIOMapWriteCombineCache : kIOMapInhibitCache);
+    // arm64: an "uncached" mapping of RAM must be Normal non-cacheable, not Device memory (unaligned accesses abort
+    // there; see nv_alloc_pages). BAR ranges keep the device mapping: the RM accesses registers aligned.
+    // (2026-11-04) RAM keeps the mode the RM asked for: an uncached/write-combined buffer is one an engine or the GSP
+    // may access non-coherently, and a cacheable alias of it is what the fabric panics on (nv_alloc_pages). RM-owned
+    // pages resolve to their allocation's own mapping below (nv_pm_alias), which already carries that attribute.
+    if (NV_XNU_ARM64 && mode != NV_MEMORY_CACHED && !nv_pm_is_gpu(start, size) && nv_xnu_keep_cached_map()) cache = kIOMapDefaultCache;
+    // arm64: the VRAM window (BAR1) and the RM's VRAM aperture (BAR2) hold structures the RM accesses unaligned (the
+    // video-engine trace header, an 8-byte store at offset 4 through BAR2, was three alignment-abort panics on
+    // 2026-11-03). A strongly-ordered device mapping faults on that; a write-combined one (Normal memory,
+    // non-cacheable, what Linux's ioremap_wc gives prefetchable BARs on arm64) allows it. Registers (BAR0) keep the
+    // strongly-ordered mapping: the RM accesses them aligned and expects them ordered.
+    if (NV_XNU_ARM64 && nv_pm_is_gpu_aperture(start, size)) cache = kIOMapWriteCombineCache;
     kprintf("NVRM-xnu: >os_map_kernel_space start=0x%llx size=0x%llx mode=%u\n", start, size, mode);
     if (!nv_pm_is_gpu(start, size)) {
         void *cookie = NULL; void *ava = nv_pm_alias(start, size, &cookie);
@@ -407,22 +420,23 @@ int nv_xnu_kmap_overlap(NvU64 phys, NvU64 len)
     }
     return 0;
 }
-void  NV_API_CALL os_io_write_byte(NvU32 addr, NvU8 v)   { NV_XNU_TRC; __asm__ __volatile__("outb %0, %1" :: "a"(v), "d"((NvU16)addr)); }
-void  NV_API_CALL os_io_write_word(NvU32 addr, NvU16 v)  { NV_XNU_TRC; __asm__ __volatile__("outw %0, %1" :: "a"(v), "d"((NvU16)addr)); }
-void  NV_API_CALL os_io_write_dword(NvU32 addr, NvU32 v) { NV_XNU_TRC; __asm__ __volatile__("outl %0, %1" :: "a"(v), "d"((NvU16)addr)); }
-NvU8  NV_API_CALL os_io_read_byte(NvU32 addr)  { NV_XNU_TRC; NvU8 v;  __asm__ __volatile__("inb %1, %0" : "=a"(v) : "d"((NvU16)addr)); return v; }
-NvU16 NV_API_CALL os_io_read_word(NvU32 addr)  { NV_XNU_TRC; NvU16 v; __asm__ __volatile__("inw %1, %0" : "=a"(v) : "d"((NvU16)addr)); return v; }
-NvU32 NV_API_CALL os_io_read_dword(NvU32 addr) { NV_XNU_TRC; NvU32 v; __asm__ __volatile__("inl %1, %0" : "=a"(v) : "d"((NvU16)addr)); return v; }
+// Legacy port I/O (nv-xnu-arch.h): real on x86, inert on Apple Silicon, which has no I/O port space.
+void  NV_API_CALL os_io_write_byte(NvU32 addr, NvU8 v)   { NV_XNU_TRC; nv_xnu_outb((uint16_t)addr, v); }
+void  NV_API_CALL os_io_write_word(NvU32 addr, NvU16 v)  { NV_XNU_TRC; nv_xnu_outw((uint16_t)addr, v); }
+void  NV_API_CALL os_io_write_dword(NvU32 addr, NvU32 v) { NV_XNU_TRC; nv_xnu_outl((uint16_t)addr, v); }
+NvU8  NV_API_CALL os_io_read_byte(NvU32 addr)  { NV_XNU_TRC; return nv_xnu_inb((uint16_t)addr); }
+NvU16 NV_API_CALL os_io_read_word(NvU32 addr)  { NV_XNU_TRC; return nv_xnu_inw((uint16_t)addr); }
+NvU32 NV_API_CALL os_io_read_dword(NvU32 addr) { NV_XNU_TRC; return nv_xnu_inl((uint16_t)addr); }
 
 NV_STATUS NV_API_CALL os_registry_init(void) { NV_XNU_TRC; return NV_OK; }
 NvBool NV_API_CALL os_is_vgx_hyper(void) { NV_XNU_TRC; return NV_FALSE; }
 NvBool NV_API_CALL os_is_grid_supported(void) { NV_XNU_TRC; return NV_FALSE; }
-NvBool NV_API_CALL os_is_efi_enabled(void) { NV_XNU_TRC; return NV_TRUE; }
+NvBool NV_API_CALL os_is_efi_enabled(void) { NV_XNU_TRC; return NV_XNU_X86 ? NV_TRUE : NV_FALSE; }   // iBoot is not EFI
 NV_STATUS NV_API_CALL os_get_is_openrm(NvBool *b) { NV_XNU_TRC; *b = NV_TRUE; return NV_OK; }
 void   NV_API_CALL os_disable_console_access(void) { NV_XNU_TRC;}
 void   NV_API_CALL os_enable_console_access(void) { NV_XNU_TRC;}
 NV_STATUS NV_API_CALL os_flush_cpu_cache_all(void) { NV_XNU_TRC; return NV_OK; }
 NV_STATUS NV_API_CALL os_flush_user_cache(void) { NV_XNU_TRC; return NV_OK; }
-void   NV_API_CALL os_flush_cpu_write_combine_buffer(void) { NV_XNU_TRC; __asm__ __volatile__("sfence" ::: "memory"); }
+void   NV_API_CALL os_flush_cpu_write_combine_buffer(void) { NV_XNU_TRC; nv_xnu_wc_flush(); }
 
 }

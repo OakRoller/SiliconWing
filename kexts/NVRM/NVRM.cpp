@@ -17,7 +17,9 @@ extern "C" void nv_xnu_power_refresh(void);   // nv_xnu_power.cpp
 #include <pexpert/pexpert.h>
 #include <kern/thread_call.h>
 #include <IOKit/IOPlatformExpert.h>
+#if NV_XNU_ACPI
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
+#endif
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <mach/mach_time.h>
 #include <kern/sched_prim.h>
@@ -49,6 +51,41 @@ __private_extern__ kmod_stop_func_t  *_antimain = NULL;
 __private_extern__ int _kext_apple_cc = __APPLE_CC__;
 }
 
+// On Apple Silicon neither kprintf (serial only) nor IOLog from this kext reaches the unified log (measured 2026-11-03),
+// so every LOG line is also kept in a 64 KB ring readable with `sysctl -n debug.nvrm_log` (oldest lines drop first).
+static char   gNvLogRing[256 * 1024];
+static size_t gNvLogLen;
+static IOSimpleLock *gNvLogLock;
+// Taken with interrupts off: the MSI filter (interruptFilter) kprintfs too, and a filter that runs on the CPU whose
+// thread is inside this function would re-take the same spin lock ("hwlock: ... trying to lock recursively",
+// the first panic of the GSP bring-up, 2026-11-03 21:04).
+static void nvrm_log_append_line(const char *line, size_t ln)
+{
+    if (!gNvLogLock) gNvLogLock = IOSimpleLockAlloc();
+    IOInterruptState is = 0;
+    if (gNvLogLock) is = IOSimpleLockLockDisableInterrupt(gNvLogLock);
+    // Plain loops, not memcpy/memmove: in this kext those names resolve to the RM's os_mem_copy shim, which kprintfs
+    // its first calls, and a kprintf from inside this function re-took the ring lock (the three "hwlock ... recursively"
+    // panics of 2026-11-03 21:04-21:06, all from NVRM::probe's first log line).
+    if (gNvLogLen + ln + 1 > sizeof gNvLogRing) {
+        size_t cut = sizeof gNvLogRing / 2; while (cut < gNvLogLen && gNvLogRing[cut] != '\n') cut++;
+        if (cut < gNvLogLen) cut++;
+        for (size_t i = 0; i < gNvLogLen - cut; i++) gNvLogRing[i] = gNvLogRing[cut + i];
+        gNvLogLen -= cut;
+    }
+    for (size_t i = 0; i < ln; i++) gNvLogRing[gNvLogLen + i] = line[i];
+    gNvLogLen += ln; gNvLogRing[gNvLogLen] = 0;
+    if (gNvLogLock) IOSimpleLockUnlockEnableInterrupt(gNvLogLock, is);
+}
+SYSCTL_STRING(_debug, OID_AUTO, nvrm_log, CTLFLAG_RD | CTLFLAG_LOCKED, gNvLogRing, 0, "NVRM-xnu bring-up log (ring)");
+extern "C" void nvrm_kprintf(const char *fmt, ...)
+{
+    char line[512]; va_list ap; va_start(ap, fmt); int n = vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
+    if (n <= 0) return; size_t ln = (size_t)n < sizeof line - 1 ? (size_t)n : sizeof line - 1;
+    nvrm_log_append_line(line, ln);
+    (kprintf)("%s", line);
+}
+// kprintf feeds the ring (nv-xnu.h), so LOG only adds the IOLog copy
 #define LOG(fmt, ...) do { kprintf("NVRM-xnu: " fmt "\n", ##__VA_ARGS__); IOLog("NVRM-xnu: " fmt "\n", ##__VA_ARGS__); } while (0)
 
 extern "C" { NvBool nvkms_xnu_load(void); }
@@ -102,8 +139,12 @@ public:
     virtual IOService *probe(IOService *provider, SInt32 *score) override;
     virtual bool start(IOService *provider) override;
     virtual void stop(IOService *provider) override;
+    virtual bool didTerminate(IOService *provider, IOOptionBits options, bool *defer) override;
     virtual void free() override;
     IOReturn go(uint32_t pass);
+    void nvDevCtlTrim(const char *when);               // clears PCIe DevCtl Enable No Snoop + Enable Relaxed Ordering
+    static void devCtlWatch(void *p0, wait_result_t w);  // re-clears them every 5 s (GSP-RM's physical BIF may set them back)
+    UInt8 fPcieCap = 0;
     static void autoGo(void *p0, wait_result_t w);
     static void bootHoldCap(thread_call_param_t p0, thread_call_param_t p1);
     void releaseBootHold(const char *why);
@@ -148,6 +189,12 @@ private:
     bool         fPrivateState = false;
     bool         fAdapter = false;
     IOLock      *fUtilizationLock = nullptr;
+    // The DevCtl watch thread reads config space through fPCI. It holds fDevCtlLock around every access and stops once
+    // fDevCtlStop is set, which didTerminate/stop do before the nub can go away (panic 2026-11-05 13:4x: the thread read
+    // a terminated nub after the eGPU left, IOPCIFamily dereferenced a dead pointer, kernel data abort).
+    IOLock      *fDevCtlLock = nullptr;
+    volatile bool fDevCtlStop = false, fDevCtlRunning = false;
+    void devCtlStopWatch(const char *why);
     void        *fUtilizationState = nullptr;
     bool         fUtilizationStopping = false;
     uint32_t     fPassDone = 0;
@@ -179,6 +226,9 @@ static bool     gNvPmClosed;
 static thread_t gNvPmOwner;
 static SInt64   gNvPmWaited;
 SYSCTL_QUAD(_debug, OID_AUTO, nvrm_pm_waited, CTLFLAG_RD, &gNvPmWaited, "RM calls that waited for a GPU resume");
+static int64_t gNvDevCtl = -1, gNvDevCtlFixes = 0;   // last PCIe DevCtl read by the watch thread; how often it had to clear NS/RO again
+SYSCTL_QUAD(_debug, OID_AUTO, nvrm_devctl, CTLFLAG_RD, &gNvDevCtl, "GPU PCIe Device Control (bit 4 RO, bit 11 No Snoop), -1 before pass 2");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrm_devctl_fixes, CTLFLAG_RD, &gNvDevCtlFixes, "times the watch thread cleared NS/RO again");
 extern "C" int nv_xnu_pm_enter(void)
 {
     if (!gNvPmGate || current_thread() == gNvPmOwner) return 0;
@@ -244,8 +294,8 @@ static void nv_xnu_pm_open(void)
     IOLockUnlock(gNvPmGate);
 }
 
-static inline void nvu_memset(void *d, int c, size_t n) { __asm__ __volatile__("rep stosb" : "+D"(d), "+c"(n) : "a"(c) : "memory"); }
-static inline void nvu_memcpy(void *d, const void *s, size_t n) { __asm__ __volatile__("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory"); }
+static inline void nvu_memset(void *d, int c, size_t n) { nv_xnu_memset(d, c, n); }
+static inline void nvu_memcpy(void *d, const void *s, size_t n) { nv_xnu_memcpy(d, s, n); }
 #define NV_XNU_MAX_CLIENTS 32768
 class NVRMUserClient;
 static NVRMUserClient *gNvClients[NV_XNU_MAX_CLIENTS];
@@ -315,6 +365,13 @@ protected:
 private:
     nv_file_private_t fNvfp = {};
     nv_alloc_mapping_context_t fMmap = {};
+    // Mappings multiplexed on this one connection, keyed by the virtual fd the userland driver bound before the
+    // map (clientMemoryForType's type). Before this, every live mapping held a user client of its own: Cyberpunk
+    // 2077 kept 876 mappings and the accelerator hit IOKit's ~1020-child ceiling (attach waits 15 s, then fails;
+    // the game's watchdog killed it, 2026-11-04). The descriptor is kept so the unmap gets the same object.
+    struct NvLiveMap { int fd; IOMemoryDescriptor *md; IOOptionBits opts; };
+    NvLiveMap *fMaps = NULL; int fMapsN = 0, fMapsCap = 0;
+    static IOReturn sUnmapDone(OSObject *target, void *reference, IOExternalMethodArguments *args);
     bool fIsCtl = true;
     int  fFd = -1;
     int  fPid = 0;
@@ -424,6 +481,7 @@ bool NVRM::start(IOService *provider)
     if (!fPCI) return false;
     // An unavailable telemetry lock disables this optional interface, not the GPU.
     fUtilizationLock = IOLockAlloc();
+    fDevCtlLock = IOLockAlloc();
     gNVRMService = this;
     nv_xnu_log_init();
     // The kernel mapping table is serialised, so its lock has to exist before RM maps anything.
@@ -440,8 +498,10 @@ bool NVRM::start(IOService *provider)
         if (!sysctlsUp) {
             sysctlsUp = true;
             sysctl_register_oid(&sysctl__debug_nvrm_isr_count); sysctl_register_oid(&sysctl__debug_nvrm_isr_handled);
+            sysctl_register_oid(&sysctl__debug_nvrm_log);
             sysctl_register_oid(&sysctl__debug_nvrm_evt_posts); sysctl_register_oid(&sysctl__debug_nvrm_evt_waits);
             sysctl_register_oid(&sysctl__debug_nvrm_pm_waited);
+            sysctl_register_oid(&sysctl__debug_nvrm_devctl); sysctl_register_oid(&sysctl__debug_nvrm_devctl_fixes);
         }
     }
     UInt8 bus = fPCI->getBusNumber(), dev = fPCI->getDeviceNumber(), fn = fPCI->getFunctionNumber();
@@ -460,6 +520,7 @@ bool NVRM::start(IOService *provider)
     nv->handle = os_pci_init_handle(0, bus, dev, fn, NULL, NULL);
     nv->regs = &nv->bars[NV_GPU_BAR_INDEX_REGS];
     nv->fb   = &nv->bars[NV_GPU_BAR_INDEX_FB];
+    nv->dma_dev = nv->niso_dma_dev = nv_xnu_dma_device_init(fPCI);   // bus addresses: through the DART on Apple Silicon
     snapshotBootScreen();
     const bool bar1Placed = placeLargeBar1();
     fBar1Placed = bar1Placed;
@@ -579,6 +640,10 @@ static const char *otherDisplayHolding(IOPCIDevice *self, uint64_t phys, uint64_
 
 void NVRM::snapshotBootScreen()
 {
+#if NV_XNU_ARM64
+    LOG("boot screen: not copied (Apple Silicon: the console is on the Apple display pipeline, not this card)");
+    return;
+#endif
     char nb[8] = { 0 };
     if (PE_parse_boot_argn("-nvrmnobootscreen", nb, sizeof(nb))) { LOG("boot screen: snapshot OFF (-nvrmnobootscreen)"); return; }
     PE_Video v; bzero(&v, sizeof v);
@@ -892,6 +957,10 @@ static void nv_xnu_dump_gsp_regs(nv_state_t *nv)
 // The largest 64-bit memory window in the host bridge's _CRS (QWord Address Space descriptors, ACPI 6.5 6.4.3.5.1).
 static bool nvrmHostWindow(IOService *dev, UInt64 *outMin, UInt64 *outMax)
 {
+#if !NV_XNU_ACPI
+    (void)dev; (void)outMin; (void)outMax;
+    return false;   // no ACPI on Apple Silicon; IOPCIFamily owns the windows
+#else
     IOACPIPlatformDevice *acpi = NULL;
     IOService *s = dev;
     for (int i = 0; s && i < 16 && !acpi; i++) { s = s->getProvider(); acpi = OSDynamicCast(IOACPIPlatformDevice, s); }
@@ -924,16 +993,21 @@ static bool nvrmHostWindow(IOService *dev, UInt64 *outMin, UInt64 *outMax)
     }
     o->release();
     return found;
+#endif
 }
 
 // CPUID 0x80000008 EAX[7:0]: the physical address width the CPU can reach (MAXPHYADDR).
 static unsigned nvrmPhysBits()
 {
+#if NV_XNU_X86
     uint32_t a, b, c, d;
     __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000000u), "c"(0u));
     if (a < 0x80000008u) return 36;
     __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000008u), "c"(0u));
     return a & 0xff;
+#else
+    return 0;   // not consulted: BAR1 is never placed by hand on Apple Silicon
+#endif
 }
 
 // True when [lo, hi] overlaps a memory range of any other PCI function, or the prefetchable window of a bridge other
@@ -974,6 +1048,10 @@ static bool nvrmRangeBusy(UInt64 lo, UInt64 hi, IOPCIDevice *self, IOPCIDevice *
 static const UInt64 kIntel39Min = 0x4000000000ULL, kIntel39Max = 0x7fffffffffULL;
 static const char *nvrmIntel39Window(unsigned physBits, UInt64 fwBar1)
 {
+#if !NV_XNU_X86
+    (void)physBits; (void)fwBar1;
+    return "not an x86 CPU";
+#else
     uint32_t a, b, c, d;
     __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0u), "c"(0u));
     if (!(b == 0x756e6547u && d == 0x49656e69u && c == 0x6c65746eu)) return "not an Intel CPU";
@@ -983,6 +1061,7 @@ static const char *nvrmIntel39Window(unsigned physBits, UInt64 fwBar1)
     if (sysctlbyname("hw.memsize", &memsize, &l, NULL, 0) != 0 || !memsize) return "hw.memsize unreadable";
     if (memsize + (4ULL << 30) >= kIntel39Min) return "RAM reaches into 256 GB";
     return NULL;
+#endif
 }
 
 // True when the bus numbers advertised by a root port contain another PCI function. When BAR1 is moved,
@@ -1010,6 +1089,12 @@ static bool nvrmBusRangeHasOtherDevices(UInt8 first, UInt8 last, IOPCIDevice *se
 
 bool NVRM::placeLargeBar1()
 {
+#if NV_XNU_ARM64
+    // Apple Silicon: no EFI console shares the card's BAR1, and the PCIe windows (Thunderbolt root ports included)
+    // belong to IOPCIFamily. BAR1 stays where it was assigned; "placed" here means "acceptable as it is".
+    LOG("bar1: left where IOPCIFamily placed it (Apple Silicon: no firmware console, no manual BAR placement)");
+    return true;
+#endif
     static const UInt64 kBigBase = 0x10000000000ULL;
     static const UInt64 kHostWindowEnd = 0x3ffbfffffffULL;
     // -nvrmsmallbar: a 256 MB BAR1, as on a card without Resizable BAR (every GTX 16 and most Turing boards), placed by
@@ -1320,7 +1405,18 @@ void NVRM::readBARs()
         UInt64 phys = dm->getPhysicalAddress();
         UInt64 size = dm->getLength();
         UInt8 off = 0;
-        for (unsigned bar = 0; bar < 6; bar++) {
+        // Which BAR register is this aperture? Ask IOPCIFamily first: on Apple Silicon the CPU address of an aperture
+        // (0x12xxxxxxxx) is not the PCI bus address in the BAR register (the apciec root translates), so matching
+        // register values against physical addresses, which is exact on x86, found nothing there (2026-11-03).
+        for (unsigned bar = 0; bar < 6 && off == 0; bar++) {
+            UInt32 lo = fPCI->configRead32(0x10 + bar * 4);
+            if (lo & 1) continue;
+            bool is64 = ((lo >> 1) & 3) == 2;
+            IODeviceMemory *byReg = fPCI->getDeviceMemoryWithRegister((UInt8)(0x10 + bar * 4));
+            if (byReg == dm) off = 0x10 + bar * 4;
+            if (is64) bar++;
+        }
+        for (unsigned bar = 0; bar < 6 && off == 0; bar++) {   // x86 and any family that keeps bus == CPU addresses
             UInt32 lo = fPCI->configRead32(0x10 + bar * 4);
             if (lo & 1) continue;
             bool is64 = ((lo >> 1) & 3) == 2;
@@ -1347,6 +1443,62 @@ void NVRM::readBARs()
     kprintf("NVRM-xnu: BARS %s\n", table);
 }
 
+// PCIe Device Control "Enable No Snoop" (bit 11). Apple Silicon's memory fabric panics on a No-Snoop read that hits a
+// CPU-cached line (AMCC UNEXP_RT_HIT_DIR, panics #8/#9 on 2026-11-04); PCIe DMA here is IO-coherent anyway, so the
+// GPU must never set NS. The RM's kernel BIF is patched to leave it clear; this clears it from config space as well
+// and reports what was there, since GSP-RM's physical BIF could set it from the card side.
+// PCIe Device Control bits the card may set on its request TLPs: bit 11 Enable No Snoop, bit 4 Enable Relaxed Ordering.
+// Apple's memory fabric (AMCC) panics on a non-coherent read of a line a CPU holds (UNEXP_RT_HIT_DIR, CMD ncrdincr_ro);
+// panics #8/#9 had both bits on, #10 had No Snoop off and RO on. Both are kept off: the fabric is IO-coherent and the
+// card sits behind Thunderbolt, so neither attribute buys anything here.
+static const UInt16 kNvDevCtlTrimMask = 0x0810;
+void NVRM::nvDevCtlTrim(const char *when)
+{
+    if (!fPcieCap)
+        for (UInt8 c = fPCI->configRead8(0x34) & 0xfc, n = 0; c && n < 48; c = fPCI->configRead8(c + 1) & 0xfc, n++)
+            if (fPCI->configRead8(c) == 0x10) { fPcieCap = c; break; }
+    if (!fPcieCap) { LOG("devctl: no PCIe capability found (%s)", when); return; }
+    const UInt16 was = fPCI->configRead16(fPcieCap + 8);
+    const UInt16 want = (UInt16)(was & ~kNvDevCtlTrimMask);
+    if (want != was) fPCI->configWrite16(fPcieCap + 8, want);
+    const UInt16 now = fPCI->configRead16(fPcieCap + 8);
+    gNvDevCtl = now;
+    LOG("devctl: DevCtl 0x%04x -> 0x%04x (%s: No Snoop %s->%s, Relaxed Ordering %s->%s)", was, now, when,
+        (was & 0x0800) ? "ON" : "off", (now & 0x0800) ? "ON" : "off", (was & 0x0010) ? "ON" : "off", (now & 0x0010) ? "ON" : "off");
+}
+// Every 5 s while the adapter is up: read DevCtl, publish it (debug.nvrm_devctl), and clear the two bits again if
+// anything (GSP-RM's physical BIF, a power event) set them back. Logs only on a change, so a quiet card is one line.
+void NVRM::devCtlWatch(void *p0, wait_result_t)
+{
+    NVRM *s = (NVRM *)p0;
+    LOG("devctl: watch thread up (every 5 s; clears No Snoop + Relaxed Ordering if set again)");
+    for (UInt64 tick = 0; !s->fDevCtlStop; tick++) {
+        for (int k = 0; k < 50 && !s->fDevCtlStop; k++) IOSleep(100);
+        IOLockLock(s->fDevCtlLock);
+        if (s->fDevCtlStop) { IOLockUnlock(s->fDevCtlLock); break; }
+        if (!s->fPCI || !s->fPcieCap || !s->fAdapter || s->isInactive() || s->fPCI->isInactive()) { IOLockUnlock(s->fDevCtlLock); continue; }
+        const UInt16 v = s->fPCI->configRead16(s->fPcieCap + 8);
+        if (v == 0xffff) { IOLockUnlock(s->fDevCtlLock); if ((tick % 12) == 0) LOG("devctl: config space reads 0xffff (card gone?)"); continue; }
+        gNvDevCtl = v;
+        if (v & kNvDevCtlTrimMask) {
+            gNvDevCtlFixes++;
+            char when[48]; snprintf(when, sizeof when, "watch tick %llu, set again", (unsigned long long)tick);
+            s->nvDevCtlTrim(when);
+        }
+        IOLockUnlock(s->fDevCtlLock);
+    }
+    LOG("devctl: watch thread stopped");
+    s->fDevCtlRunning = false;
+    s->release();
+    thread_terminate(current_thread());
+}
+void NVRM::devCtlStopWatch(const char *why)
+{
+    if (!fDevCtlLock) return;
+    IOLockLock(fDevCtlLock); const bool was = fDevCtlRunning && !fDevCtlStop; fDevCtlStop = true; IOLockUnlock(fDevCtlLock);
+    if (was) LOG("devctl: watch told to stop (%s); it touches config space no more", why);
+}
+
 IOReturn NVRM::go(uint32_t pass)
 {
     // Bringing up the GPU and the RM for the first time is an administrator
@@ -1367,6 +1519,13 @@ IOReturn NVRM::go(uint32_t pass)
     nv_state_t *nv = &fNv;
     LOG("go(pass %u) — done so far: %u", pass, fPassDone);
     LOG("anchor: os_mem_set runtime 0x%llx (slide = runtime - its nm link address)", (unsigned long long)(uintptr_t)&os_mem_set);
+    {   // Memory-space decoding must be on before the RM reads PMC_BOOT_0 in rm_is_supported_device (pass 1). x86
+        // firmware leaves it on; Apple Silicon publishes the function with command 0x0000, and every BAR0 read then
+        // answered 0xFFFFFFFF, which the RM reported as NV_ERR_GPU_IS_LOST (measured 2026-11-03).
+        const UInt16 before = fPCI->configRead16(0x04);
+        if ((before & 0x6) != 0x6) { fPCI->setMemoryEnable(true); fPCI->setBusMasterEnable(true); }
+        LOG("PCI command 0x%04x -> 0x%04x (memory space + bus master on before the RM touches BAR0)", before, fPCI->configRead16(0x04));
+    }
     if (pass >= 1 && fPassDone < 1) {
         char nopmArg[8] = { 0 };
         if (!gRmInitDone) {
@@ -1419,30 +1578,61 @@ IOReturn NVRM::go(uint32_t pass)
         fPCI->setMemoryEnable(true);
         fPCI->setBusMasterEnable(true);
         LOG("bus master + memory enabled (command 0x%04x)", fPCI->configRead16(0x04));
+        {   // be the nub's client before asking it for resources; IOPCIFamily ties some of them to the opener
+            bool opened = fPCI->isOpen(this) || fPCI->open(this);
+            LOG("IOPCIDevice open(this) -> %s", opened ? "yes" : "NO");
+        }
         int msi = -1;
-        for (int i = 0; i < 8; i++) {
-            int type = 0;
-            if (fPCI->getInterruptType(i, &type) != kIOReturnSuccess) break;
-            LOG("  interrupt source %d type 0x%x%s", i, type, (type & kIOInterruptTypePCIMessaged) ? " (MSI)" : "");
-            if (msi < 0 && (type & kIOInterruptTypePCIMessaged)) msi = i;
+        for (int attempt = 0; attempt < 2 && msi < 0; attempt++) {
+            for (int i = 0; i < 8; i++) {
+                int type = 0;
+                if (fPCI->getInterruptType(i, &type) != kIOReturnSuccess) break;
+                LOG("  interrupt source %d type 0x%x%s", i, type, (type & kIOInterruptTypePCIMessaged) ? " (MSI)" : "");
+                if (msi < 0 && (type & kIOInterruptTypePCIMessaged)) msi = i;
+            }
+            if (msi >= 0 || attempt) break;
+            // Apple Silicon (measured 2026-11-03, M1 Pro, Thunderbolt eGPU): the nub carries no interrupt sources until
+            // the driver asks IOPCIFamily to allocate MSI vectors; x86 publishes them with the nub, so this is a no-op there.
+            IOReturn cr = fPCI->configureInterrupts(kIOInterruptTypePCIMessaged, 1, 1, 0);
+            IOByteCount msiOff = 0; UInt32 msiCap = fPCI->extendedFindPCICapability(kIOPCIMSICapability, &msiOff);
+            LOG("no MSI source yet: configureInterrupts(MSI, 1, 1) -> 0x%x; MSI cap 0x%x at 0x%x, control now 0x%04x; looking again",
+                (unsigned)cr, (unsigned)msiCap, (unsigned)msiOff, msiOff ? fPCI->configRead16((UInt8)(msiOff + 2)) : 0);
+            OSObject *spec = fPCI->getProperty("IOInterruptSpecifiers");
+            LOG("IOInterruptSpecifiers on the nub: %s", spec ? "present" : "absent");
         }
         if (msi < 0) { LOG("no MSI source on the device — refusing (the RM needs message-signalled interrupts)"); return kIOReturnUnsupported; }
-        fWorkLoop = IOWorkLoop::workLoop();
-        fIntSrc = IOFilterInterruptEventSource::filterInterruptEventSource(this,
-                    OSMemberFunctionCast(IOInterruptEventAction, this, &NVRM::interruptOccurred),
-                    OSMemberFunctionCast(IOFilterInterruptAction, this, &NVRM::interruptFilter), fPCI, msi);
-        if (!fWorkLoop || !fIntSrc || fWorkLoop->addEventSource(fIntSrc) != kIOReturnSuccess) { LOG("interrupt source setup FAILED"); return kIOReturnError; }
+        // A rerun of go(2) after a failed one (nvrmctl go 2) must reuse the interrupt source: registering the same
+        // MSI index twice panics the kernel ("addInterruptStatistics call for index 1 would have clobbered existing
+        // statistics", 2026-11-04 02:53, after a boot whose firmware read had failed).
+        if (!fIntSrc) {
+            if (!fWorkLoop) fWorkLoop = IOWorkLoop::workLoop();
+            fIntSrc = IOFilterInterruptEventSource::filterInterruptEventSource(this,
+                        OSMemberFunctionCast(IOInterruptEventAction, this, &NVRM::interruptOccurred),
+                        OSMemberFunctionCast(IOFilterInterruptAction, this, &NVRM::interruptFilter), fPCI, msi);
+            if (!fWorkLoop || !fIntSrc || fWorkLoop->addEventSource(fIntSrc) != kIOReturnSuccess) {
+                LOG("interrupt source setup FAILED");
+                if (fIntSrc) { fIntSrc->release(); fIntSrc = NULL; }
+                return kIOReturnError;
+            }
+        } else LOG("interrupt source kept from the previous attempt");
         fIntSrc->enable();
         nv->interrupt_line = (NvU32)msi;
         LOG("MSI %d armed; calling rm_init_adapter() — GSP boot from inside macOS", msi);
+        nvDevCtlTrim("before rm_init_adapter");
         NvBool ok = rm_init_adapter(NULL, nv);
         LOG("rm_init_adapter -> %s", ok ? "OK" : "FAILED");
+        nvDevCtlTrim("after rm_init_adapter");   // GSP-RM's physical BIF may have set them back
         nv_xnu_dump_live_allocs();
         nv_xnu_dump_gsp_regs(nv);
-        if (!ok) return kIOReturnError;
+        if (!ok) { fIntSrc->disable(); return kIOReturnError; }   // the source stays registered for the rerun
         fAdapter = true;
         LOG("PASS 2 REACHED: the adapter is up — GSP-RM is running on the card under macOS");
         fPassDone = 2;
+        if (fDevCtlLock && !fDevCtlRunning && !fDevCtlStop) {
+            thread_t th; retain(); fDevCtlRunning = true;
+            if (kernel_thread_start(&NVRM::devCtlWatch, this, &th) == KERN_SUCCESS) thread_deallocate(th);
+            else { fDevCtlRunning = false; release(); LOG("devctl: watch thread could not start"); }
+        }
         {
             NvU32 ramKb = 0, totalKb = 0, qst = 0;
             if (nvrm_query_vram_kb(nv->gpu_id, &ramKb, &totalKb, &qst) && ramKb) {
@@ -1478,8 +1668,20 @@ void NVRM::interruptOccurred(IOInterruptEventSource *src, int count)
     if (handled && needBottomHalf) rm_isr_bh(NULL, &fNv);
 }
 
+// The PCI nub is opened in go(). IOKit defers a client's stop() for as long as that client holds its provider open
+// (IOService::didTerminate), so an unplug left NVRM "inactive, busy 1" forever and nothing could unload it (measured
+// 2026-11-03 on the eGPU). Close before the default didTerminate looks, and again in stop() for the other paths.
+bool NVRM::didTerminate(IOService *provider, IOOptionBits options, bool *defer)
+{
+    devCtlStopWatch("didTerminate");
+    if (fPCI && fPCI->isOpen(this)) { fPCI->close(this); LOG("didTerminate: PCI nub closed (card gone)"); }
+    return super::didTerminate(provider, options, defer);
+}
+
 void NVRM::stop(IOService *provider)
 {
+    devCtlStopWatch("stop");
+    if (fPCI && fPCI->isOpen(this)) fPCI->close(this);
     // Keep the lock until free(): another service can retain this object and
     // call its platform interface after stop(), when it must answer NotReady.
     if (fUtilizationLock) {
@@ -1507,6 +1709,7 @@ void NVRM::stop(IOService *provider)
 
 void NVRM::free()
 {
+    if (fDevCtlLock) { IOLockFree(fDevCtlLock); fDevCtlLock = nullptr; }
     if (fUtilizationLock) { IOLockFree(fUtilizationLock); fUtilizationLock = nullptr; }
     super::free();
 }
@@ -1608,6 +1811,7 @@ bool NVRM::pciRestoreAfterWake()
     if (!s.valid) { LOG("wake: no saved config - leaving what IOPCIFamily restored"); return true; }
     if (fPCI->configRead16(0x00) != 0x10de) { LOG("wake: config space answers vendor 0x%04x - the GPU is not on the bus", fPCI->configRead16(0x00)); return false; }
     unsigned fixed = 0;
+#if NV_XNU_X86   // the root port windows were set by placeLargeBar1 and are ours to restore; on Apple Silicon IOPCIFamily owns them
     if (s.rp) {
         bool winDiff = false;
         for (unsigned i = 0; i < 6; i++) {
@@ -1626,6 +1830,7 @@ bool NVRM::pciRestoreAfterWake()
         UInt16 rc = s.rp->configRead16(0x04);
         if ((rc & 0x6) != (s.rpCmd & 0x6)) { s.rp->configWrite16(0x04, rc | (s.rpCmd & 0x6)); fixed++; }
     }
+#endif
     bool gpuDiff = false;
     for (unsigned i = 0; i < s.rbCount; i++) {
         UInt32 cur = fPCI->extendedConfigRead32(s.rbOff[i]);
@@ -1753,6 +1958,22 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
             return kIOReturnNoResources;
         }
         if (nv_xnu_chat()) kprintf("NVRM-xnu: bridge client created for the accelerator (rm type %u)\n", (unsigned)(uintptr_t)p2);
+        // p4 (newer NVAccelArm): the accelerator service to attach the client to. Done here so a failure is explained
+        // in this kext's log ring (the accelerator's own kprintf does not reach it) and the client is closed, not just
+        // released, so its table slot and its pmap bookkeeping go with it.
+        IOService *accel = (IOService *)p4;
+        if (accel) {
+            const bool attached = uc->attach(accel);
+            const bool started = attached && uc->start(accel);
+            if (!attached || !started) {
+                kprintf("NVRM-xnu: bridge client fd %d: %s FAILED (accelerator inactive %d, NVRM inactive %d, client inactive %d, accel retain %d)\n",
+                        uc->index(), attached ? "start" : "attach", (int)accel->isInactive(), (int)isInactive(), (int)uc->isInactive(), accel->getRetainCount());
+                if (attached) uc->detach(accel);
+                uc->clientClose();
+                uc->release();
+                return kIOReturnInternalError;
+            }
+        }
         *out = uc;
         return kIOReturnSuccess;
     }
@@ -1850,6 +2071,8 @@ IOReturn NVRMUserClient::clientClose(void)
         // landed in the reused block. Marking the context dead is enough; free() does the release,
         // and IOKit only gets there once no method can still be running.
         fMmap.valid = NV_FALSE;
+        for (int i = 0; i < fMapsN; i++) fMaps[i].md->release();
+        fMapsN = 0;
         if (nv_xnu_chat()) kprintf("NVRM-xnu: client fd %d closed\n", fFd);
     }
     terminate();
@@ -1857,7 +2080,26 @@ IOReturn NVRMUserClient::clientClose(void)
 }
 void NVRMUserClient::free(void)
 {
+    // A client that is released without ever being closed (the accelerator could not attach or start it, so
+    // newUserClient released it) still sat in gNvClients: the next initWithTask's per-process count then read
+    // fPid out of freed memory. Cyberpunk 2077 opened 173 clients in five minutes, 28 of them were released this way,
+    // and the Mac panicked in initWithTask+0x11c (2026-11-04 02:23). The slot is the object's: it goes with it.
+    if (OSCompareAndSwap(0, 1, &fCleaned)) {
+        if (gNvClientsLock && fFd >= 0) {
+            IOLockLock(gNvClientsLock);
+            if (gNvClients[fFd] == this) gNvClients[fFd] = NULL;
+            nv_pm_close(fPm);
+            IOLockUnlock(gNvClientsLock);
+            kprintf("NVRM-xnu: client fd %d (pid %d) freed without a close - slot cleared\n", fFd, fPid);
+        }
+    } else if (gNvClientsLock && fFd >= 0) {
+        IOLockLock(gNvClientsLock);
+        if (gNvClients[fFd] == this) gNvClients[fFd] = NULL;   // closed, but belt and braces: never leave a freed object in the table
+        IOLockUnlock(gNvClientsLock);
+    }
     if (fMmap.memArea.pRanges) { kern_os_free(fMmap.memArea.pRanges); fMmap.memArea.pRanges = NULL; }
+    for (int i = 0; i < fMapsN; i++) fMaps[i].md->release();
+    fMapsN = 0; if (fMaps) { kern_os_free(fMaps); fMaps = NULL; fMapsCap = 0; }
     if (fGate) { IOLockFree(fGate); fGate = nullptr; }
     super::free();
 }
@@ -1865,6 +2107,15 @@ IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
 {
     Gate g(fGate);
     nv_alloc_mapping_context_t *c = &fMmap;
+    if (type != 0) {
+        // a mapping already made under this virtual fd: the unmap (or a second map) asks for it by the same type
+        for (int i = 0; i < fMapsN; i++) if (fMaps[i].fd == (int)type) {
+            fMaps[i].md->retain(); *options |= fMaps[i].opts; *memory = fMaps[i].md; return kIOReturnSuccess; }
+        if (!c->valid || fBound != (int)type) {
+            kprintf("NVRM-xnu: map type %u on client %d: no mapping context for that fd (bound %d, context %d)\n", (unsigned)type, fFd, fBound, (int)c->valid);
+            return kIOReturnBadArgument;
+        }
+    }
     if (!c->valid) { kprintf("NVRM-xnu: map on fd %d with no mapping context\n", fFd); return kIOReturnBadArgument; }
     IOMemoryDescriptor *md = NULL;
     NvU32 caching = c->caching;
@@ -1915,8 +2166,35 @@ IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
     if (caching == NV_MEMORY_UNCACHED) *options |= kIOMapInhibitCache;
     else if (caching == NV_MEMORY_WRITECOMBINED) *options |= kIOMapWriteCombineCache;
     if (!(c->prot & NV_PROTECT_WRITEABLE)) *options |= kIOMapReadOnly;
+    if (type != 0) {
+        if (fMapsN == fMapsCap) {
+            const int cap = fMapsCap ? fMapsCap * 2 : 64;
+            NvLiveMap *n = (NvLiveMap *)kern_os_malloc(sizeof(NvLiveMap) * (size_t)cap);
+            if (!n) { md->release(); return kIOReturnNoMemory; }
+            for (int i = 0; i < fMapsN; i++) n[i] = fMaps[i];
+            if (fMaps) kern_os_free(fMaps);
+            fMaps = n; fMapsCap = cap;
+        }
+        md->retain();
+        fMaps[fMapsN].fd = (int)type; fMaps[fMapsN].md = md; fMaps[fMapsN].opts = *options; fMapsN++;
+        nvMmapContextClear(c);   // consumed: the next bind on this connection starts with a clean context
+        if (nv_xnu_chat() && (fMapsN <= 4 || (fMapsN % 256) == 0)) kprintf("NVRM-xnu: client %d holds %d multiplexed mapping(s)\n", fFd, fMapsN);
+    }
     *memory = md;
     return kIOReturnSuccess;
+}
+IOReturn NVRMUserClient::sUnmapDone(OSObject *target, void *reference, IOExternalMethodArguments *args)
+{
+    NVRMUserClient *me = OSDynamicCast(NVRMUserClient, target);
+    if (!me) return kIOReturnNotAttached;
+    const int fd = (int)(int64_t)args->scalarInput[0];
+    Gate g(me->fGate);
+    for (int i = 0; i < me->fMapsN; i++) if (me->fMaps[i].fd == fd) {
+        me->fMaps[i].md->release();
+        me->fMaps[i] = me->fMaps[--me->fMapsN];
+        return kIOReturnSuccess;
+    }
+    return kIOReturnNotFound;
 }
 IOReturn NVRMUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
                                         IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
@@ -1930,6 +2208,7 @@ IOReturn NVRMUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
         { sRetired, 0, 0, 0, 0 },
         { sRetired, 0, 0, 0, 0 },
         { sWaitEvent, 2, 0, 1, 0 },
+        { sUnmapDone, 1, 0, 0, 0 },   // 7: the userland driver released a multiplexed mapping (virtual fd)
     };
     if (selector >= sizeof tbl / sizeof tbl[0]) return kIOReturnBadArgument;
     IOExternalMethodDispatch d = tbl[selector];

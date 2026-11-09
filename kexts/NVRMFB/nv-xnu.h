@@ -10,6 +10,7 @@
 #include <IOKit/IOLocks.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/libkern.h>
+#include "nv-xnu-arch.h"
 
 extern "C" {
 enum UvmPmaGpuMemoryType_tag {};

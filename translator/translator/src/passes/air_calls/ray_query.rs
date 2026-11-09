@@ -110,6 +110,10 @@ struct Lowering {
 
 #[derive(Clone, Copy, Debug)]
 enum Structure {
+    /// A 64-bit device address value (or a pointer to convert): an acceleration structure the kernel
+    /// loaded out of a buffer, whose handle in memory is the structure's device address (the plugin's
+    /// gpuResourceID), converted with OpConvertUToAccelerationStructureKHR.
+    Value(Word),
     Variable(Word),
     Address {
         root: Word,
@@ -174,8 +178,20 @@ impl Lowering {
         let mut chain = Vec::new();
         for _ in 0..16 {
             let Some(def) = defining_instruction(ctx, entry_idx, cursor) else {
+                let f = &ctx.module.functions[entry_idx];
+                let param = f.parameters.iter().find(|p| p.result_id == Some(cursor)).map(|p| p.result_type);
+                let fname = f.def.as_ref().and_then(|d| d.result_id);
+                let name = ctx.module.debug_names.iter().find(|n| n.class.opcode == Op::Name && n.operands.first() == Some(&Operand::IdRef(cursor))).and_then(|n| match n.operands.get(1) { Some(Operand::LiteralString(s)) => Some(s.clone()), _ => None });
+                let elsewhere: Vec<String> = ctx.module.functions.iter().enumerate().flat_map(|(fi, func)| {
+                    let mut v = Vec::new();
+                    if func.parameters.iter().any(|p| p.result_id == Some(cursor)) { v.push(format!("param of #{fi}")); }
+                    for b in &func.blocks { for inst in &b.instructions { if inst.result_id == Some(cursor) { v.push(format!("{:?} in #{fi}", inst.class.opcode)); } } }
+                    v
+                }).collect();
+                let uses: Vec<String> = ctx.module.functions[entry_idx].blocks.iter().flat_map(|b| b.instructions.iter().filter(|i| i.operands.contains(&Operand::IdRef(cursor))).map(|i| format!("{:?}", i.class.opcode))).take(4).collect();
                 return Err(format!(
-                    "ray query: the acceleration structure operand %{operand} has no definition in the entry function or the globals"
+                    "ray query: the acceleration structure operand %{operand} (cursor %{cursor}, name {name:?}, chain {chain:?}) has no definition in function #{entry_idx} (id {fname:?}, {} params, parameter type {param:?}) or the globals; defined elsewhere: {elsewhere:?}; used by {uses:?}",
+                    f.parameters.len()
                 ));
             };
             match def.class.opcode {
@@ -235,6 +251,24 @@ impl Lowering {
                 Op::AccessChain | Op::InBoundsAccessChain | Op::Bitcast | Op::CopyObject | Op::PtrAccessChain => {
                     chain.push(cursor);
                     cursor = id_operand(&def, 0)?;
+                }
+                Op::Load | Op::ConvertUToPtr | Op::ConvertPtrToU | Op::UConvert | Op::SConvert | Op::IAdd | Op::BitwiseOr | Op::Phi | Op::Select | Op::FunctionCall | Op::CompositeExtract => {
+                    // a value, not a pointer to a descriptor: its 64 bits are the structure's device address
+                    let ty = def.result_type.and_then(|t| type_def_of(ctx, t));
+                    let is_address = ty.as_ref().is_some_and(|t| match t.class.opcode {
+                        Op::TypeInt => matches!(t.operands.first(), Some(Operand::LiteralBit32(64))),
+                        Op::TypePointer => true,
+                        _ => false,
+                    });
+                    if !is_address {
+                        return Err(format!(
+                            "ray query: the acceleration structure operand %{operand} is a {:?} of type {:?}, not a 64-bit address",
+                            def.class.opcode,
+                            ty.map(|t| t.class.opcode)
+                        ));
+                    }
+                    self.dead_chains.extend(chain);
+                    return Ok(Structure::Value(cursor));
                 }
                 other => {
                     return Err(format!(
@@ -354,6 +388,34 @@ impl Lowering {
         structure: Structure,
     ) -> Word {
         match structure {
+            Structure::Value(value) => {
+                ctx.add_capability(Capability::Int64);
+                let ulong = ctx.ty_ulong();
+                let is_pointer = defining_instruction(ctx, 0, value)
+                    .and_then(|d| d.result_type)
+                    .and_then(|t| type_def_of(ctx, t))
+                    .is_some_and(|t| t.class.opcode == Op::TypePointer);
+                let address = if is_pointer {
+                    let id = ctx.module.fresh_id();
+                    out.push(Instruction::new(
+                        Op::ConvertPtrToU,
+                        Some(ulong),
+                        Some(id),
+                        vec![Operand::IdRef(value)],
+                    ));
+                    id
+                } else {
+                    value
+                };
+                let id = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::ConvertUToAccelerationStructureKHR,
+                    Some(self.as_ty),
+                    Some(id),
+                    vec![Operand::IdRef(address)],
+                ));
+                id
+            }
             Structure::Variable(var) => {
                 let id = ctx.module.fresh_id();
                 out.push(Instruction::new(

@@ -20,6 +20,21 @@ pub struct LinkedFunctionTable {
     pub entries: Vec<LinkedFunction>,
 }
 
+/// The `parameter_index` of a runtime table that is not a kernel parameter: a visible function table
+/// the kernel loads out of an argument buffer (Metal Shader Converter's IRDispatchRaysArgument keeps the
+/// DXR callable table there). Every `@air.get_function_pointer_visible_function_table` lookup whose
+/// table operand traces to no parameter reads this table, whose slots hold the ids
+/// `rewrite_runtime_table_lookups` loads (candidate k has id k + 1).
+pub const AMBIENT_TABLE_PARAMETER: u32 = u32::MAX;
+
+impl LinkedFunctionLinkage {
+    pub fn ambient_table(&self) -> Option<&LinkedFunctionTable> {
+        self.visible_tables
+            .iter()
+            .find(|table| table.parameter_index == AMBIENT_TABLE_PARAMETER)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkedFunction {
     pub index: u32,
@@ -715,6 +730,9 @@ fn visible_table_flow<'a>(
     })?;
     let mut flow = LinkedFlow::default();
     for table in tables {
+        if table.parameter_index == AMBIENT_TABLE_PARAMETER {
+            continue;
+        }
         let parameter = entry_signature
             .parameters
             .get(table.parameter_index as usize)
@@ -741,7 +759,10 @@ fn visible_table_flow<'a>(
             ));
         }
     }
-    propagate_linked_flow(entry_ll, &signatures, &mut flow)?;
+    let ambient = tables
+        .iter()
+        .find(|table| table.parameter_index == AMBIENT_TABLE_PARAMETER);
+    propagate_linked_flow(entry_ll, &signatures, &mut flow, ambient)?;
     Ok((signatures, flow))
 }
 
@@ -835,7 +856,11 @@ pub fn specialize_visible_function_tables(
                     ));
                 }
                 let table_value = value_operand(arguments[0]);
-                if let Some(table) = tables_by_value.get(table_value) {
+                if let Some(table) = tables_by_value
+                    .get(table_value)
+                    .copied()
+                    .or_else(|| linkage.ambient_table())
+                {
                     pointers.insert(
                         result.to_string(),
                         PointerTrace {
@@ -1676,6 +1701,7 @@ fn propagate_linked_flow<'a>(
     ll: &str,
     signatures: &HashMap<String, FunctionSignature>,
     flow: &mut LinkedFlow<'a>,
+    ambient: Option<&'a LinkedFunctionTable>,
 ) -> Result<(), String> {
     loop {
         let mut changed = false;
@@ -1714,9 +1740,10 @@ fn propagate_linked_flow<'a>(
                     let arguments = call_arguments(instruction)?;
                     if let Some(table) = arguments
                         .first()
-                        .and_then(|argument| tables.get(value_operand(argument)))
+                        .and_then(|argument| tables.get(value_operand(argument)).copied())
+                        .or(ambient)
                     {
-                        pointers.insert(result.to_string(), *table);
+                        pointers.insert(result.to_string(), table);
                     }
                 } else if instruction.starts_with("bitcast ")
                     || instruction.starts_with("addrspacecast ")
@@ -2983,7 +3010,9 @@ pub fn rewrite_runtime_table_lookups(
     entry_name: &str,
     parameter_indices: &[u32],
 ) -> Result<String, String> {
-    if parameter_indices.is_empty() {
+    if parameter_indices.is_empty()
+        && !entry_ll.contains("@air.get_function_pointer_visible_function_table(")
+    {
         return Ok(entry_ll.to_string());
     }
     let traced = trace_visible_function_table_parameters(entry_ll, entry_name, parameter_indices)?;
@@ -3011,25 +3040,38 @@ pub fn rewrite_runtime_table_lookups(
             }
             let table_arg = arguments[0].trim();
             let table_value = value_operand(table_arg);
+            // a table that traces to no parameter is the ambient one (loaded from an argument buffer):
+            // its slots hold ids all the same
             let is_table = traced
                 .get(function)
-                .is_some_and(|values| values.contains(table_value));
+                .is_some_and(|values| values.contains(table_value))
+                || !traced.values().any(|values| values.contains(table_value));
             if is_table {
                 let table_ty = table_arg[..table_arg.len() - table_value.len()].trim();
-                if !table_ty.starts_with("ptr") {
-                    return Err(format!(
-                        "runtime table operand is not an opaque pointer ({table_ty}): {trimmed}"
-                    ));
-                }
                 let slot = arguments[1].trim();
                 let k = counter;
                 counter += 1;
                 let indent = &line[..line.len() - trimmed.len()];
-                output.push_str(&format!(
-                    "{indent}%m2v.vft.p{k} = getelementptr inbounds i64, {table_arg}, {slot}\n\
-                     {indent}%m2v.vft.id{k} = load i64, ptr addrspace(1) %m2v.vft.p{k}, align 8\n\
-                     {indent}%m2v.vft.s{k} = trunc i64 %m2v.vft.id{k} to i32\n"
-                ));
+                if table_ty.starts_with("ptr") {
+                    output.push_str(&format!(
+                        "{indent}%m2v.vft.p{k} = getelementptr inbounds i64, {table_arg}, {slot}\n\
+                         {indent}%m2v.vft.id{k} = load i64, ptr addrspace(1) %m2v.vft.p{k}, align 8\n\
+                         {indent}%m2v.vft.s{k} = trunc i64 %m2v.vft.id{k} to i32\n"
+                    ));
+                } else {
+                    // typed pointers (older AIR): the table is `%struct._visible_function_table_t addrspace(1)*`
+                    if !table_ty.ends_with("addrspace(1)*") {
+                        return Err(format!(
+                            "runtime table operand is not a device pointer ({table_ty}): {trimmed}"
+                        ));
+                    }
+                    output.push_str(&format!(
+                        "{indent}%m2v.vft.b{k} = bitcast {table_arg} to i64 addrspace(1)*\n\
+                         {indent}%m2v.vft.p{k} = getelementptr inbounds i64, i64 addrspace(1)* %m2v.vft.b{k}, {slot}\n\
+                         {indent}%m2v.vft.id{k} = load i64, i64 addrspace(1)* %m2v.vft.p{k}, align 8\n\
+                         {indent}%m2v.vft.s{k} = trunc i64 %m2v.vft.id{k} to i32\n"
+                    ));
+                }
                 let open = instruction
                     .find("@air.get_function_pointer_visible_function_table(")
                     .unwrap();
@@ -3045,7 +3087,7 @@ pub fn rewrite_runtime_table_lookups(
         output.push_str(line);
         output.push('\n');
     }
-    if rewrote == 0 {
+    if rewrote == 0 && !parameter_indices.is_empty() {
         return Err(
             "runtime visible function table: the entry declares a table but no lookup reads it"
                 .into(),

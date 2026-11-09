@@ -5,10 +5,12 @@
  */
 
 #pragma once
+#define NVMTL_BL_MAX 128   /* buffer copies a blit encoder batches between barriers (WAS 16) */
 #include <stdint.h>
 #include <stddef.h>
 const char *nvmtl_image_ident(const void *addr, char *out, size_t n);
-typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; int mtype1; /* memory type + 1 when known */ } nvk_buffer;
+#define NVMTL_PT_MAX 512
+typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; int mtype1; /* memory type + 1 when known */ int shm; /* adopted by shmirror */ } nvk_buffer;
 #include "nvmtl_sample_positions.h"
 typedef struct { void *img; void *mem; void *view; uint32_t w, h; size_t alloc; uint32_t layout; uint32_t mips; uint32_t fmt, bpp; uint32_t storage, mtl_type, layers; int placed; uint32_t bw, bh; uint32_t samples; uint32_t sysmem; uint32_t vkflags, usage;  uint32_t vfl;  uint64_t up_token; } nvk_image;
 #define NVMTL_NVAR 16
@@ -81,7 +83,8 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  unsigned direct_sass;   /* recorded a dispatch of compiled machine code: never reuse this pool */
                  void *occlusion_pages; uint32_t occlusion_count;
                  void *timing_pool; nvmtl_gpu_interval timing;
-                 void *pt_pool; unsigned pt_n, pt_open; uint32_t pt_w[128], pt_h[128], pt_f[128]; uint32_t pt_fs[128][4];
+                 uint64_t tl_begin, tl_seal, tl_commit; unsigned tl_inflight, tl_why, tl_whymask, tl_evwait, tl_cpuwait;   /* timeline (passtime rec lines): recording begun, part sealed, buffer committed (UPTIME_RAW ns), parts in flight at submit */
+                 void *pt_pool; const char *pt_who; unsigned pt_n, pt_open, pt_curfs, pass_draws; uint32_t pt_d[NVMTL_PT_MAX]; uint64_t bl_w[NVMTL_BL_MAX][2], bl_r[NVMTL_BL_MAX][2]; unsigned bl_nw, bl_nr, bl_open, bl_ops; uint64_t (*bl_q)[7]; unsigned bl_nq, bl_capq; uint32_t pt_w[NVMTL_PT_MAX], pt_h[NVMTL_PT_MAX], pt_f[NVMTL_PT_MAX]; uint32_t pt_fs[NVMTL_PT_MAX][4];
                  void *counter_recording; unsigned counter_error;
                  nvmtl_sample_pattern sample_pattern;
                  void **rvs; unsigned nrv, caprv;
@@ -92,7 +95,12 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  void *graphics_pipeline, *graphics_layout, *graphics_sets[3];
                  uint32_t graphics_set_count, graphics_offset_count, graphics_offsets[4], gl_uniform_dyn[2];
                  uint32_t gl_uniform_result; /* optional diagnostics for the next recorded draw */
-               } nvk_cmdbuf;
+                 uint32_t lastk_h[48], lastk_n;
+#define NVMTL_SHM_WB 32
+                 uint64_t shm_wb[NVMTL_SHM_WB][3]; unsigned shm_nwb, shm_wb_over, shm_writer; uint64_t (*shm_wbx)[3]; unsigned shm_nwbx, shm_capx;   /* shmirror: plugin writes into Shared memory to copy back (va, shadow, len) */   /* SPIR-V hashes of the kernels dispatched into this buffer (device-loss record; copied into its submission part) */
+                 uint64_t pre_ticks[2];   /* passtime: the part's prologue start / end timestamps (0: none) */
+  int pre_timed;           /* this submission recorded prologue timestamps 2-3 in its timing pool */
+} nvk_cmdbuf;
 int  nvmtl_vk_init(void);
 int nvmtl_vk_sample_positions_backend(void);
 int nvmtl_vk_sample_positions_default(uint32_t count, nvmtl_sample_pattern *out);
@@ -106,6 +114,11 @@ void nvmtl_vk_limits(uint32_t *layers, uint32_t *shared_bytes, uint32_t wg[3], u
 int nvmtl_vk_tg_reject(const uint32_t l[3], const uint32_t *t, const char *kernel, uint32_t lin);
 void nvmtl_vk_pubcaps(uint32_t *color_samples, uint32_t *depth_samples, uint64_t *max_storage_range, uint64_t *linear_align);
 int  nvmtl_vk_buffer_create(size_t size, int host_visible, nvk_buffer *out);
+int  nvmtl_vk_buffer_create_tables(size_t size, nvk_buffer *out, int ring);
+int  nvmtl_vk_buffer_twin(nvk_buffer *b, uint64_t *addr, uint64_t *shadow);
+int  nvmtl_vk_pre_copy_va(uint64_t src, uint64_t dst, uint64_t size);
+void nvmtl_devcpy(void *dst, const void *src, size_t n);
+void nvmtl_devset0(void *dst, size_t n);
 enum { NVP_BEGIN, NVP_BUFNEW, NVP_BUFPOOL, NVP_BUFDEL, NVP_HEAP, NVP_SYNCIN, NVP_SYNCOUT, NVP_COPY, NVP_N };
 uint64_t nvmtl_perf_now(void);
 void nvmtl_perf_note(int what, uint64_t t0, uint64_t bytes);
@@ -195,6 +208,16 @@ void nvmtl_vk_cmd_dispatch_threads(nvk_cmdbuf *c, nvk_pipeline *p, const uint32_
 void nvmtl_vk_cmd_dispatch_indirect_tg(nvk_cmdbuf *c, nvk_pipeline *p, nvk_buffer *b, size_t off, const uint32_t tg[3]);
 void nvmtl_vk_cmd_end_render(nvk_cmdbuf *c);
 int  nvmtl_vk_submit_wait_at(nvk_cmdbuf *c, const char *who);
+void nvmtl_vk_submit_wait_stats(uint64_t *total_ns, uint64_t *waits);
+uint64_t nvmtl_vk_queue_submits(void);
+uint64_t nvmtl_vk_gpu_busy_ns(void);   // GPU time of all timed submissions so far   // vkQueueSubmit calls so far
+void nvmtl_vk_explain_fault_host(void);
+uint64_t nvmtl_vk_memory_address(void *vk_device_memory);   // NVK: the GPU VA of a VkDeviceMemory (diagnostics)
+uint64_t nvmtl_vk_last_fault_addr(void);
+uint32_t nvmtl_vk_crumb_now(void);
+void nvmtl_vk_bindless_shadow(uint32_t slot, void **view, void **storage, void **texel, uint32_t *texelStorage, uint32_t *writes);
+void *nvmtl_vk_dummy_texel_view(void);
+int nvmtl_vk_image_read_keep(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes);   // diagnostic readback that restores the layout   // NVK: the id of the last dispatch crumb issued (NVK_DISPATCH_CRUMBS)                    // NVK: the last MMU fault address, 0 before a fault   // device loss: is the faulting VA the CPU address of a host-pointer import?   // fence waits so far (the device-loss dispatch record orders commits by it)
 typedef struct nvmtl_inflight nvmtl_inflight;
 nvmtl_inflight *nvmtl_vk_inflight_new(void);
 void nvmtl_vk_inflight_free(nvmtl_inflight *f);
@@ -206,6 +229,14 @@ int nvmtl_vk_vram_room(uint64_t want);
 uint64_t nvmtl_vk_vram_free_now(void);
 uint64_t nvmtl_vk_vram_headroom(void);
 void nvmtl_vk_bindless_rewrite(uint32_t slot, void *view);
+uint64_t nvmtl_vk_commit_seq_bump(void);
+void nvmtl_vk_image_retire(nvk_image *i, void *v1, void *v2, void *v3, void *tbAlias, void *tbView);   // deferred destroy (graveyard)
+void nvmtl_vk_graves_reap(uint64_t done_seq);
+void nvmtl_vk_graves_reap2(uint64_t done_seq, uint64_t own_seq);
+void nvmtl_vk_cb_reap(uint64_t own_seq);
+uint64_t nvmtl_vk_seq_now(void);
+uint64_t nvmtl_vk_seq_done(void);
+void nvmtl_vk_bindless_rewrite_full(uint32_t slot, void *view, void *storageView, void *texelView, int texelStorage);
 void nvmtl_vk_res2_stats(uint64_t out[5]);
 int nvmtl_vk_buffer_migrate(nvk_buffer *b, int to_sysmem);
 void nvmtl_vk_res3_stats(uint64_t out[6]);
@@ -213,6 +244,8 @@ int  nvmtl_vk_submit_begin_at(nvk_cmdbuf *c, nvmtl_inflight *f, const char *who)
 #define nvmtl_vk_submit_wait(c) nvmtl_vk_submit_wait_at((c), __func__)
 #define nvmtl_vk_submit_begin(c, f) nvmtl_vk_submit_begin_at((c), (f), __func__)
 int  nvmtl_vk_submit_finish(nvmtl_inflight *f);
+int  nvmtl_vk_cmd_copy_buffer_batched(nvk_cmdbuf *c, nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
+void nvmtl_vk_cmd_blit_settle(nvk_cmdbuf *c);
 void nvmtl_vk_gsub_nvk_stats(uint64_t *out, unsigned n);
 int nvmtl_vk_pre_open(void);
 int nvmtl_vk_pre_copy(nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
@@ -230,8 +263,11 @@ int  nvmtl_vk_image_create_mips(uint32_t w, uint32_t h, int bgra, uint32_t mips,
 int  nvmtl_vk_image_create_ex(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, nvk_image *out);
 int  nvmtl_vk_image_create_ex2(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, nvk_image *out);
 int  nvmtl_vk_format_is_storage(uint32_t vkfmt);
+int  nvmtl_vk_image_self_storage(const nvk_image *img);   // the image's own view is a storage image (not an sRGB image writable only through UNORM views)
 int  nvmtl_vk_bind_storage_view(nvk_cmdbuf *c, uint32_t set, uint32_t index, void *view);
 uint32_t nvmtl_vk_bindless_put(void *view);
+uint32_t nvmtl_vk_bindless_put_full(void *view, void *storageView, void *texelView, int texelStorage);
+uint32_t nvmtl_vk_bindless_next(void);   // storage image / texel-buffer views of the same resource, or NULL
 uint32_t nvmtl_vk_bindless_sampler_slot(void *vksampler);
 void     nvmtl_vk_bindless_drop(uint32_t slot);
 int  nvmtl_vk_pipeline_create_ex(const void *vs, size_t vn, const void *fs, size_t fn, uint32_t vkfmt, int hasDepth, nvk_pipeline *out);
@@ -283,6 +319,9 @@ int  nvmtl_vk_image_view_create_range_swz(nvk_image *img, uint32_t vkfmt, int a8
                                           uint32_t layerCount, uint32_t mtl_view_type, const uint8_t mtl_swz[4], void **out_view);
 void nvmtl_vk_pipeline_sig(const nvk_pipeline *p, nvk_rtsig *out);
 int  nvmtl_vk_pipeline_compatible(const nvk_rtsig *sig, const nvk_pipeline *p);
+int  nvmtl_vk_pipeline_subset(const nvk_rtsig *sig, const nvk_pipeline *p);
+void nvmtl_vk_rtsig_text(const nvk_rtsig *s, char *out, size_t n);
+void nvmtl_vk_pipeline_sig_text(const nvk_pipeline *p, char *out, size_t n);
 int nvmtl_vk_cmd_draw_patches(nvk_cmdbuf *c, const nvk_pipeline *p, uint64_t fac, uint32_t istride, float scale, uint64_t cpx, uint64_t pix,
                               uint32_t start, uint32_t count, uint32_t instances, uint32_t baseInstance, nvk_buffer *ind, size_t indoff);
 int nvmtl_vk_pipeline_create_vin(const void *vs, size_t vn, const void *fs, size_t fn, uint32_t vkfmt, uint32_t depthfmt, const nvk_blend_state *blend,
@@ -322,7 +361,11 @@ size_t nvmtl_vk_allocated_bytes(void);
 uint64_t nvmtl_vk_buffer_address(nvk_buffer *b);
 
 int nvmtl_vk_image_create_typed(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, int storage, uint32_t mtl_type, uint32_t layers, nvk_image *out);
-typedef struct { void *mem; void *map; size_t size; uint32_t memtype; int host_visible; } nvk_heap;
+typedef struct { void *mem; void *map; size_t size; uint32_t memtype; int host_visible; int shm; /* adopted by shmirror */
+                 int lazy; uint32_t nck; void **ck; uint32_t *ckb; uint8_t *ckt; /* lazy: VRAM in NVMTL_HEAP_CK chunks, made on first use */ } nvk_heap;
+#define NVMTL_HEAP_CK (64ull << 20)
+int  nvmtl_vk_heap_create_lazy(size_t size, nvk_heap *out);
+int  nvmtl_vk_heap_twin(nvk_heap *h, uint64_t *addr, uint64_t *shadow);
 int  nvmtl_vk_heap_create(size_t size, int host_visible, nvk_heap *out);
 int  nvmtl_vk_format_block(uint32_t vkfmt, uint32_t *bw, uint32_t *bh, uint32_t *block_bytes);
 static inline uint32_t nvmtl_vk_layers_for_type(uint32_t t, uint32_t n) { n = n ? n : 1; return (t == 1 || t == 3 || t == 8) ? n : t == 5 ? 6u : t == 6 ? 6u * n : 1u; }
@@ -361,6 +404,7 @@ int nvmtl_vk_cmd_copy_image(nvk_cmdbuf *c, nvk_image *src, uint32_t sx, uint32_t
                         nvk_image *dst, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);
 
 void nvmtl_vk_copy_aspect_override(uint32_t aspect, uint32_t bpp);
+int nvmtl_vk_copy_aspect_active(void);
 int nvmtl_vk_cmd_copy_buffer_to_image_level_layer(nvk_cmdbuf *c, nvk_buffer *b, size_t off, uint32_t row_bytes, nvk_image *img, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level, uint32_t layer);
 int nvmtl_vk_cmd_copy_image_to_buffer_level_layer(nvk_cmdbuf *c, nvk_image *img, uint32_t x, uint32_t y, uint32_t w, uint32_t h, nvk_buffer *b, size_t off, uint32_t row_bytes, uint32_t level, uint32_t layer);
 int nvmtl_vk_cmd_copy_buffer_to_image_layer(nvk_cmdbuf *c, nvk_buffer *b, size_t off, uint32_t row_bytes,

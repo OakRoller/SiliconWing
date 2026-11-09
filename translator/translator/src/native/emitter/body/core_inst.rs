@@ -1272,7 +1272,7 @@ impl Emitter {
         name: String,
         _instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
-        if self.opaque_resource_pointers.contains(&name) && self.values.contains_key(&name) {
+        if super::super::functions::names_contain(&self.opaque_resource_pointers, &name) && self.values.contains_key(&name) {
             return Ok(());
         }
         let src_ty = self.resolve_type(&src.ty)?;
@@ -2124,16 +2124,20 @@ impl Emitter {
                 return Ok(());
             }
             if let Some(raw) = self.raw_offsets.get(ptr_name).cloned() {
+                if std::env::var_os("METAL2VULKAN_LOAD_DBG").is_some() {
+                    eprintln!("[load-dbg] {name} = load {result_ty:?} from {ptr_name}: raw root={} const_off={} dyn_terms={} device_addr_base={:?} opaque_res={} opaque_smp={} bda_mode={}",
+                        raw.root, raw.const_off, raw.dyn_terms.len(), raw.device_addr_base, super::super::functions::names_contain(&self.opaque_resource_pointers, &name), super::super::functions::names_contain(&self.opaque_sampler_pointers, &name), self.bda_device_pointers);
+                }
                 // A sampler an argument buffer holds is its gpuResourceID, whose low word is the sampler-heap slot, whether
                 // the buffer is reached through a device address or bound directly (Blender binds its 17-sampler argument
                 // buffer directly; refusing it left the pipeline unbuilt and crashed Blender). Textures keep the
                 // device-address requirement: a directly bound buffer's texture fields have their own bindings.
-                let sampler_field = matches!(result_ty, LlType::Ptr(2)) && self.opaque_sampler_pointers.contains(&name)
+                let sampler_field = matches!(result_ty, LlType::Ptr(2)) && super::super::functions::names_contain(&self.opaque_sampler_pointers, &name)
                     && crate::argument_buffer_samplers_on();
                 if (raw.device_addr_base.is_some() || sampler_field)
                     && crate::reflect::bindless_fixed_fields_on()
                     && ((matches!(result_ty, LlType::Ptr(1))
-                        && self.opaque_resource_pointers.contains(&name))
+                        && super::super::functions::names_contain(&self.opaque_resource_pointers, &name))
                         || sampler_field)
                 {
                     let sampler = matches!(result_ty, LlType::Ptr(2));
@@ -2146,7 +2150,14 @@ impl Emitter {
                     };
                     let mask = self.const_uint(slots - 1)?;
                     let u32_ty = self.type_id(&LlType::Int(32))?;
-                    let slot = self.fresh();
+                    let slot = if sampler {
+                        self.result_id(
+                            &super::super::functions::sampler_slot_name(&name),
+                            &LlType::Int(32),
+                        )?
+                    } else {
+                        self.fresh()
+                    };
                     instructions.push(Self::inst(
                         Op::BitwiseAnd,
                         Some(u32_ty),
@@ -2162,7 +2173,7 @@ impl Emitter {
                     );
                     return Ok(());
                 }
-                if self.bda_device_pointers && !self.opaque_resource_pointers.contains(&name) {
+                if self.bda_device_pointers && !super::super::functions::names_contain(&self.opaque_resource_pointers, &name) {
                     if let LlType::Ptr(1 | 2) = result_ty {
                         let addr = self.result_id(&bda_address_name(&name), &LlType::Int(64))?;
                         self.emit_raw_load(addr, &LlType::Int(64), &raw, load.align, instructions)?;

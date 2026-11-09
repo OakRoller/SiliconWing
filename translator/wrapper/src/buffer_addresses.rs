@@ -48,6 +48,9 @@ fn data_dependent(v: u32, local: &HashMap<u32, &Instruction>, defs: &HashMap<u32
 /// data-dependent value, and whose pointers reach nothing but access chains, loads, stores and OpArrayLength (a call
 /// or a pointer used as a value would need the pointer in both forms, so such a root is lowered as before). Returns
 /// the kept roots and every pointer derived from them.
+/// shmirror (notes item 66): a buffer the shader stores to must reach memory through a physical address, where the store
+/// can be noted for the copy-back; set by the plugin (nvmtl_shm_lower_stored_roots) while Shared memory is mirrored.
+pub static LOWER_STORED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 fn kept_roots(m: &rspirv::dr::Module, defs: &HashMap<u32, Instruction>, sb_types: &HashMap<u32, u32>, roots: &[(u32, u32, u32)], value_types: &HashMap<u32, u32>) -> (HashSet<u32>, HashSet<u32>) {
     let local: HashMap<u32, &Instruction> = m.functions.iter().flat_map(|f| f.blocks.iter()).flat_map(|b| b.instructions.iter()).filter_map(|i| Some((i.result_id?, i))).collect();
     let mut owner: HashMap<u32, u32> = roots.iter().filter(|r| sb_types.get(&r.1).is_some_and(|&p| holds_runtime_array(p, defs, 0))).map(|r| (r.0, r.0)).collect();
@@ -62,6 +65,7 @@ fn kept_roots(m: &rspirv::dr::Module, defs: &HashMap<u32, Instruction>, sb_types
                 let (mut seen, mut budget) = (HashSet::new(), 96u32);
                 if i.operands.iter().skip(1).filter_map(id).any(|x| data_dependent(x, &local, defs, value_types, &mut seen, &mut budget)) { needs.insert(root); }
             }
+            Op::Store if LOWER_STORED.load(std::sync::atomic::Ordering::Relaxed) => { bad.insert(root); }
             Op::Load | Op::Store | Op::ArrayLength => {}
             _ => { bad.insert(root); }
         }

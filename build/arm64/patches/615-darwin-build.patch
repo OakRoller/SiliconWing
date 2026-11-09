@@ -1,0 +1,167 @@
+diff --git a/src/common/inc/nvUnixVersion.h b/src/common/inc/nvUnixVersion.h
+index b757607..6310c83 100644
+--- a/src/common/inc/nvUnixVersion.h
++++ b/src/common/inc/nvUnixVersion.h
+@@ -3,7 +3,7 @@
+ 
+ #if defined(NV_LINUX) || defined(NV_BSD) || defined(NV_SUNOS) || defined(NV_VMWARE) || defined(NV_QNX) || defined(NV_INTEGRITY) || \
+     (defined(RMCFG_FEATURE_PLATFORM_GSP) && RMCFG_FEATURE_PLATFORM_GSP == 1) || \
+-    defined(NV_DCECORE)
++    defined(NV_DCECORE) || defined(NV_DARWIN)
+ 
+ #define NV_VERSION_STRING               "615.78.08"
+ 
+diff --git a/src/common/sdk/nvidia/inc/cpuopsys.h b/src/common/sdk/nvidia/inc/cpuopsys.h
+index 6467b39..efd8b07 100644
+--- a/src/common/sdk/nvidia/inc/cpuopsys.h
++++ b/src/common/sdk/nvidia/inc/cpuopsys.h
+@@ -149,7 +149,8 @@
+ #   define NVCPU_IA64              /* any IA64 for any opsys */
+ #endif
+ 
+-#if (defined(NV_MACINTOSH) && !(defined(__i386__) || defined(__x86_64__)))  || defined(__PPC__) || defined(__ppc)
++/* NV_DARWIN: an Apple Silicon Mac is NV_MACINTOSH but not PowerPC; without this it was taken for a big-endian PPC Mac. */
++#if (defined(NV_MACINTOSH) && !(defined(__i386__) || defined(__x86_64__) || defined(__aarch64__) || defined(__arm64__)))  || defined(__PPC__) || defined(__ppc)
+ #    if defined(__powerpc64__) && defined(__LITTLE_ENDIAN__)
+ #       ifndef NVCPU_PPC64LE
+ #           define NVCPU_PPC64LE           /* PPC 64-bit little endian */
+diff --git a/src/nvidia/arch/nvalloc/unix/src/os.c b/src/nvidia/arch/nvalloc/unix/src/os.c
+index faa5e25..ccdedb8 100644
+--- a/src/nvidia/arch/nvalloc/unix/src/os.c
++++ b/src/nvidia/arch/nvalloc/unix/src/os.c
+@@ -969,7 +969,18 @@ NV_STATUS osAllocPagesInternal(
+ 
+     memdescSetMemData(pMemDesc, NULL, NULL);
+ 
+-#if (defined(NVCPU_AARCH64) && RMCFG_MODULE_CL)
++#if defined(NV_DARWIN) && defined(__aarch64__)
++    //
++    // NV_DARWIN on Apple Silicon: the accessor above reports every sysmem memdesc as CACHED so that the
++    // kernel RM's own engines map and copy coherently (g_mem_desc_nvoc.h). The OS layer, however, needs the
++    // cache type the RM actually asked for: a buffer the RM allocates UNCACHED/WRITECOMBINED is one the GSP
++    // or an engine may access non-coherently (sysmembar flush page, GSP notify-op and state-monitor pages,
++    // libos init arguments, video trace ring), and the Apple memory fabric panics (AMCC UNEXP_RT_HIT_DIR) when
++    // a non-coherent access hits a line a CPU holds. The kext maps those as Device memory, which no CPU cache
++    // (not even a speculative fetch) can hold; the RM libraries are built -mstrict-align for that.
++    //
++    cpuCacheAttrib = pMemDesc->_cpuCacheAttrib;
++#elif (defined(NVCPU_AARCH64) && RMCFG_MODULE_CL)
+     {
+         OBJCL   *pCl       = SYS_GET_CL(pSys);
+ 
+diff --git a/src/nvidia/generated/g_mem_desc_nvoc.h b/src/nvidia/generated/g_mem_desc_nvoc.h
+index cdee92f..899100c 100644
+--- a/src/nvidia/generated/g_mem_desc_nvoc.h
++++ b/src/nvidia/generated/g_mem_desc_nvoc.h
+@@ -1309,6 +1309,17 @@ memdescGetRootOffset(PMEMORY_DESCRIPTOR pMemDesc)
+ static inline NvU32
+ memdescGetCpuCacheAttrib(MEMORY_DESCRIPTOR *pMemDesc)
+ {
++#if defined(NV_DARWIN) && defined(__aarch64__)
++    //
++    // NV_DARWIN on Apple Silicon: PCIe DMA is IO-coherent, and the memory fabric PANICS the machine on a
++    // No-Snoop read that hits a line a CPU holds (AMCC "UNEXP_RT_HIT_DIR", cmd ncrdincr_ro). System memory
++    // is therefore always CACHED to the RM: coherent GMMU aperture (kgmmuGetMemAperture, the DMA mapper),
++    // coherent CE phys mode (channel_utils) and coherent GSP DMA target. The OS layer maps every RAM page
++    // cacheable to match (os-xnu.cpp, nv_alloc_pages), whatever cache type the RM asked for.
++    //
++    if (pMemDesc->_addressSpace == ADDR_SYSMEM)
++        return 0; /* NV_MEMORY_CACHED: nvos.h is not in every translation unit this header reaches */
++#endif
+     return pMemDesc->_cpuCacheAttrib;
+ }
+ 
+diff --git a/src/nvidia/src/kernel/gpu/bif/kernel_bif.c b/src/nvidia/src/kernel/gpu/bif/kernel_bif.c
+index b5e64bf..f951583 100644
+--- a/src/nvidia/src/kernel/gpu/bif/kernel_bif.c
++++ b/src/nvidia/src/kernel/gpu/bif/kernel_bif.c
+@@ -829,7 +829,17 @@ kbifInitPcieDeviceControlStatus_IMPL
+     // the upstream root port is known to be broken with respect to this
+     // feature.
+     //
++#if defined(NV_DARWIN) && defined(__aarch64__)
++    //
++    // NV_DARWIN on Apple Silicon: with No-Snoop already off, the AMCC still caught a non-coherent
++    // read (CMD ncrdincr_ro) of a CPU-held line from the card and panicked (2026-11-04, third time),
++    // so the remaining TLP attribute, Relaxed Ordering, is kept off too: the fabric treats RO
++    // requests as a class of their own. Over Thunderbolt the ordering relaxation buys nothing.
++    //
++    if (NV_FALSE)
++#else
+     if (!pCl->getProperty(pCl, PDB_PROP_CL_RELAXED_ORDERING_NOT_CAPABLE))
++#endif
+     {
+         kbifPcieConfigEnableRelaxedOrdering_HAL(pGpu, pKernelBif);
+     }
+@@ -847,8 +857,17 @@ kbifInitPcieDeviceControlStatus_IMPL
+         pCl->setProperty(pCl, PDB_PROP_CL_ROOTPORT_NEEDS_NOSNOOP_WAR, NV_TRUE);
+     }
+ 
++#if defined(NV_DARWIN) && defined(__aarch64__)
++    //
++    // NV_DARWIN on Apple Silicon: a No-Snoop read that hits a line a CPU holds panics the machine
++    // (AMCC UNEXP_RT_HIT_DIR). The fabric is IO-coherent, so No-Snoop buys nothing here: keep
++    // DEVICE_CONTROL_STATUS_ENABLE_NO_SNOOP clear whatever the chipset table says.
++    //
++    if (NV_FALSE)
++#else
+     if (!pCl->getProperty(pCl, PDB_PROP_CL_NOSNOOP_NOT_CAPABLE) &&
+         !pCl->getProperty(pCl, PDB_PROP_CL_ROOTPORT_NEEDS_NOSNOOP_WAR))
++#endif
+     {
+         // Bug 393398 - Re-enable DEVICE_CONTROL_STATUS_ENABLE_NO_SNOOP
+         kbifEnableNoSnoop_HAL(pGpu, pKernelBif, NV_TRUE);
+diff --git a/src/nvidia/src/kernel/gpu/mem_mgr/arch/maxwell/mem_mgr_gm107.c b/src/nvidia/src/kernel/gpu/mem_mgr/arch/maxwell/mem_mgr_gm107.c
+index 3a254a7..8b72c5b 100644
+--- a/src/nvidia/src/kernel/gpu/mem_mgr/arch/maxwell/mem_mgr_gm107.c
++++ b/src/nvidia/src/kernel/gpu/mem_mgr/arch/maxwell/mem_mgr_gm107.c
+@@ -1264,6 +1264,11 @@ memmgrSetMemDescPageSize_GM107
+     {
+         NvU64 sysmemPageSize = osGetPageSize();
+         RmPhysAddr physAddr = memdescGetPte(pMemDesc, addressTranslation, 0);
++        // NV_DARWIN: a 16 KB OS page is not a GPU page size; such memory maps at RM_PAGE_SIZE.
++        if ((sysmemPageSize > RM_PAGE_SIZE) && (sysmemPageSize < RM_PAGE_SIZE_64K))
++        {
++            sysmemPageSize = RM_PAGE_SIZE;
++        }
+         switch (pageSizeAttr)
+         {
+             case RM_ATTR_PAGE_SIZE_DEFAULT:
+diff --git a/src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c b/src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c
+index 41007bf..1509305 100644
+--- a/src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c
++++ b/src/nvidia/src/kernel/gpu/mem_mgr/mem_desc.c
+@@ -4798,7 +4798,12 @@ NvU64 memdescGetAdjustedPageSize(
+         if (pageSize == 0)
+         {
+             pageSize = osGetPageSize();
+-            memdescSetPageSize(pMemDesc, AT_GPU, pageSize);
++            //
++            // NV_DARWIN: the allocation happens in OS pages (the returned pageSize), but the
++            // GPU maps a 16 KB OS page as four RM pages, so the memdesc records RM_PAGE_SIZE.
++            //
++            memdescSetPageSize(pMemDesc, AT_GPU,
++                ((pageSize > RM_PAGE_SIZE) && (pageSize < RM_PAGE_SIZE_64K)) ? RM_PAGE_SIZE : pageSize);
+         }
+     }
+ 
+diff --git a/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c b/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c
+index 73bebf9..ff4e24a 100644
+--- a/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c
++++ b/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c
+@@ -1946,6 +1946,15 @@ memmgrDeterminePageSize_IMPL
+         }
+     }
+ 
++    //
++    // NV_DARWIN: an OS page size the GPU cannot map (16 KB on Apple Silicon) maps
++    // at RM_PAGE_SIZE; the OS layer inflates its page arrays to RM pages anyway.
++    //
++    if ((pageSize > RM_PAGE_SIZE) && (pageSize < RM_PAGE_SIZE_64K))
++    {
++        pageSize = RM_PAGE_SIZE;
++    }
++
+     switch (pageSize)
+     {
+         case RM_PAGE_SIZE:

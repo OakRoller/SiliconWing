@@ -10,6 +10,18 @@
 #include <IOKit/IOLocks.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/libkern.h>
+#include "nv-xnu-arch.h"
+// Every kprintf in this kext also lands in the log ring that `sysctl -n debug.nvrm_log` reads: on Apple Silicon kprintf
+// goes to a serial console nobody has and IOLog is dropped from the unified log, so the ring is the only way to read
+// the bring-up (NVRM.cpp owns the ring; the real kprintf is still called through the parenthesised name).
+#ifdef __cplusplus
+extern "C" {
+#endif
+void nvrm_kprintf(const char *fmt, ...) __printflike(1, 2);
+#ifdef __cplusplus
+}
+#endif
+#define kprintf(...) nvrm_kprintf(__VA_ARGS__)
 
 extern "C" {
 enum UvmPmaGpuMemoryType_tag {};
@@ -30,6 +42,7 @@ struct nv_xnu_pci_slot {
 extern "C" {
 void nv_xnu_register_pci(IOPCIDevice *pci, NvU32 domain, NvU8 bus, NvU8 slot, NvU8 function);
 void nv_xnu_register_all_pci(void);
+nv_dma_device_t *nv_xnu_dma_device_init(IOPCIDevice *pci);   // nv_xnu_dma.cpp: the GPU's IOMMU mapper, or identity on a PC
 NvBool nvkms_xnu_backlight(NvBool set, NvU32 *percent);   // os-nvkms-xnu.cpp: laptop panel brightness
 void *kern_os_malloc(size_t size);
 void  kern_os_free(void *addr);

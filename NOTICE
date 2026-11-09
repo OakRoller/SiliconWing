@@ -1,3 +1,10 @@
+SiliconWing - NVIDIA eGPUs for Apple Silicon
+
+SiliconWing is the Apple Silicon port of the NullMoth NVIDIA Metal driver. Like the driver it is based on, it is
+licensed under the PolyForm Noncommercial License 1.0.0 (LICENSE): free for personal and other noncommercial use, not
+for commercial use. Both required notices (NullMoth Systems; the SiliconWing contributors) are in LICENSE and must
+travel with every copy. The third-party components below keep their own licences.
+
 NullMoth NVIDIA Metal driver — third-party components
 
 The licence texts below ship in the package's licenses/ folder and are installed to /Library/NullMoth/licenses.

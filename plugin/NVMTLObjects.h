@@ -1,3 +1,6 @@
+// shmirror (nvmtl_shm.c, docs/ARM64-PORT-NOTES.md item 66)
+int nvmtl_shm_on(void);
+struct nvmtl_shm_nvk_cmdbuf_fwd;
 /*
  * NullMoth NVIDIA driver for macOS
  * Copyright (c) 2026 NullMoth Systems.
@@ -11,6 +14,12 @@
 #include "nvmtl_vk.h"
 #include "nvmtl_cmd_refusal.h"
 
+// A texture a shader may write: ShaderWrite, or ShaderAtomic (0x20, macOS 14): Metal's texture atomics need only the
+// latter. Deciding on ShaderWrite alone gave Cyberpunk 2077's light-culling counter (a texture_buffer<uint> with
+// ShaderRead|ShaderAtomic) no storage descriptor: its atomics hit the shared dummy texel buffer, which nothing clears,
+// the returned offsets grew every frame and the light list was written gigabytes past its buffer (benchmark channel
+// fault, 2026-11-05).
+#define NVMTL_USAGE_WRITES(u) ((((NSUInteger)(u)) & ((NSUInteger)MTLTextureUsageShaderWrite | (NSUInteger)0x20)) != 0)
 static inline NSMutableData *nvmtl_fc_storage(NSUInteger count) {
     const NSUInteger stride = 2 * sizeof(uint32_t) + sizeof(void *) + 16;
     if (!count || count > NSUIntegerMax / stride) return nil;
@@ -115,7 +124,7 @@ extern id gNVMTLMainDevice;
 @interface NVMTLCommandBuffer : NSObject <MTLCommandBuffer> {
   NSError *_cbError;
   NSMutableDictionary *_userDictionary;
-  @public nvk_cmdbuf _c; NVMTLCommandQueue *_queue; BOOL _committed, _commitMarking, _partsRetiring; BOOL _capacityHeld; MTLCommandBufferStatus _cbstatus;
+  @public nvk_cmdbuf _c; NVMTLCommandQueue *_queue; BOOL _committed, _commitMarking, _partsRetiring; BOOL _capacityHeld; MTLCommandBufferStatus _cbstatus; uint64_t _commitSeq;
   NVMTLTexture *_present;
   NSMutableArray *_presentations;
   NSMutableArray *_handlers;
@@ -228,7 +237,8 @@ uint64_t nvmtl_resid_for_texture(id t);
 uint64_t nvmtl_resid_for_sampler(id s);
 
 @interface NVMTLParallelRenderCommandEncoder : NSObject <MTLParallelRenderCommandEncoder> { @public NVMTLCommandBuffer *_cb; MTLRenderPassDescriptor *_desc;
-  NSMutableArray *_subs; NSLock *_lock; BOOL _ended; NSString *_label; } @end
+  NSMutableArray *_subs; NSLock *_lock; BOOL _ended; NSString *_label;
+  BOOL _direct; NSMutableArray *_shadows; } @end
 
 @interface NVMTLCounter : NSObject <MTLCounter> @end
 @interface NVMTLCounterSet : NSObject <MTLCounterSet> { @public NSArray *_counters; } @end
@@ -267,6 +277,7 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d);
 @interface NVMTLDepthStencilState () { @public NSString *_label; } @end
 @interface NVMTLSamplerState () { @public NSString *_label; } @end
 @interface NVMTLComputePipelineState () { @public NSString *_label; } @end
+@interface NVMTLComputePipelineState () { @public uint32_t _spvHash; } @end   // fnv-1a of the SPIR-V, for the device-loss dispatch record (every Cyberpunk kernel is named cs_main_)
 @interface NVMTLComputePipelineState () { @public uint64_t _resid; NSUInteger _attrT, _askT; } @end
 // _sassKernel: machine code that runs before the Vulkan pipeline; _sassOnly: there is no Vulkan pipeline
 @interface NVMTLComputePipelineState () { @public id _sassKernel; BOOL _sassOnly; } @end
@@ -286,12 +297,31 @@ NSUInteger nvmtl_air_max_tg(NVMTLFunction *fn);
 @interface NVMTLHeap () { @public uint32_t _purge; } @end
 #include <os/lock.h>
 @interface NVMTLHeap () { @public NSUInteger *_fr; uint32_t _nfr, _cfr; os_unfair_lock _fl; BOOL _backed; } @end
+typedef struct { NSUInteger o, n; uint64_t seq; } nvmtl_heap_pend_t;
+@interface NVMTLHeap () { @public nvmtl_heap_pend_t *_pend; uint32_t _npend, _cpend; nvmtl_heap_pend_t _recent[64]; uint32_t _nrecent; } @end
 @interface NVMTLBuffer () { @public BOOL _subPlaced; } @end
 typedef struct { nvk_image img; uint32_t key[12]; NSUInteger off, len; } nvmtl_park_t;
 @interface NVMTLTexture () { @public BOOL _subPlaced, _parkable; uint32_t _pkey[12]; NSUInteger _pkLen; } @end
 @interface NVMTLTexture () { @public BOOL _clientWritten; } @end
+@interface NVMTLTexture () { @public uint32_t _hUp, _hCopyIn, _hRT, _hMips, _hRepl, _hLastFill, _hFirstUse; char _hLastKind; } @end
+@interface NVMTLTexture () { @public uint64_t _hFillSeq0, _hEarlySeq; uint32_t _hEarlyFrame, _hBornFrame; void *_hEarlyCB, *_hFillCB; } @end
+@interface NVMTLCommandBuffer () { @public NSMutableArray *_hFillList, *_hEarlyList; } @end
+@interface NVMTLTexture () { @public uint8_t _wExp[64]; uint32_t _wLen, _wLevel, _wLayer, _wX, _wY, _wW, _wH, _wGen, _wExpGen, _wUpFrame, _wReported; BOOL _wValid; } @end
+void nvlog_diag(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 @interface NVMTLCommandBuffer () { @public NSDictionary *_busyMarks; } @end
+@interface NVMTLCommandBuffer () { @public NSMutableData *_lw; BOOL _lwChecked; uint64_t _lwCommitNs; } @end
+@interface NVMTLBuffer () { @public _Atomic uint64_t _lwDoneNs; } @end
+@interface NVMTLBuffer () { @public BOOL _abReg; } @end
+void nvmtl_lw_done(NVMTLCommandBuffer *cb);
+void nvmtl_frames_done(unsigned n);
+extern _Atomic uint64_t nvmtl_fm_views_made, nvmtl_fm_views_gone, nvmtl_fm_blit2tex;
+unsigned nvmtl_frames_ahead(void);
+void nvmtl_lw_note(NVMTLCommandBuffer *cb, NVMTLBuffer *nb, NSUInteger off);
+void nvmtl_lw_commit(NVMTLCommandBuffer *cb);
+void nvmtl_lw_check(NVMTLCommandBuffer *cb, int hasWait);
+NSString *nvmtl_cb_describe(NVMTLCommandBuffer *cb);
 @interface NVMTLHeap () { @public nvmtl_park_t *_pk; uint32_t _npk; } @end
+@interface NVMTLHeap () { @public NSUInteger _hiw; /* high-water of placements, 32 MB chunks */ } @end
 @interface NVMTLBuffer () { @public nvmtl_park_t *_bpk; uint32_t _nbpk; os_unfair_lock _bpl; } @end
 @interface NVMTLTexture () { @public BOOL _bparkable; } @end
 static void nvmtl_heap_park(NVMTLHeap *h, nvk_image *img, const uint32_t *key, NSUInteger off, NSUInteger len);
@@ -321,8 +351,16 @@ extern unsigned nvmtl_apps1_resolve_miss, nvmtl_apps1_resolve_extra, nvmtl_apps1
 - (instancetype)initWithIOSurface:(IOSurfaceRef)surface label:(NSString *)label;
 - (IOSurfaceRef)ioSurface;
 @end
+#if NVMTL_DEVICE_ARM64
+@interface _MTLDevice (NVMTLApps1)   // implemented in _MTLDevice; the arm64 device calls up to it
+- (id<MTLTexture>)newSharedTextureWithHandle:(MTLSharedTextureHandle *)handle;
+@end
+#else
 @interface MTLIOAccelDevice (NVMTLApps1)
 - (id<MTLTexture>)newSharedTextureWithHandle:(MTLSharedTextureHandle *)handle;
 @end
+#endif
 
 NSDictionary *nvmtl_index_argument_fields(NSArray *fields);
+@interface NVMTLRenderCommandEncoder () { @public uint32_t _passDraws; } @end
+@interface NVMTLRenderCommandEncoder () { @public void *_ppBuf; NSMutableData *_ppMeta; uint32_t _ppN; BOOL _ppAfter; uint32_t _ppKind; uint64_t _ppA[5]; void *_ppInd; uint64_t _ppIndOff; } @end   // draws recorded by this encoder (passdump)

@@ -6,12 +6,29 @@ set -u
 PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
 # the NVIDIA driver only: the AMD/Intel GPU driver, the NPU driver and the audio driver are separate products with
 # their own uninstallers
-KEXTS="NVRM NVAccel NVRMFB NVRMAGDC NVPrimarySelector"; EXT=/Library/Extensions; GB=/Library/GPUBundles
+# ARCH picks the kext set and the kernel-collection arguments (install.sh explains both); every x86_64 line is the one
+# that shipped. Apple Silicon installs NVRM and NVAccelArm only (docs/ARM64-PORT-NOTES.md).
+ARCH=$(uname -m)
+case $ARCH in
+  arm64) KEXTS="NVRM NVAccelArm"; KARCH=arm64e;;
+  *) KEXTS="NVRM NVAccel NVRMFB NVRMAGDC NVPrimarySelector"; KARCH=x86_64;;
+esac
+EXT=/Library/Extensions; GB=/Library/GPUBundles
 KC=/Library/KernelCollections/AuxiliaryKernelExtensions.kc
 K=/System/Library/Kernels/kernel
+if [ "$ARCH" = arm64 ]; then
+  # /System/Library/Kernels/kernel is the x86_64 image on an Apple Silicon Mac; the running kernel is the per-chip one
+  chip=$(sysctl -n kern.version 2>/dev/null | sed -nE 's/.*RELEASE_ARM64_([A-Za-z0-9]+).*/\1/p' | tr '[:upper:]' '[:lower:]')
+  K=""; [ -z "$chip" ] || K="/System/Library/Kernels/kernel.release.$chip"
+fi
 KARG=(--allow-missing-kdk); [ -f "$K" ] && KARG+=(--kernel "$K")   # without a matching Kernel Debug Kit, kmutil needs --allow-missing-kdk
 KB=/System/Library/KernelCollections/BootKernelExtensions.kc
 KS=/System/Library/KernelCollections/SystemKernelExtensions.kc
+if [ "$ARCH" = arm64 ]; then
+  # one file holds the kernel and the boot and system kexts on Apple Silicon (the Preboot kernelcache); kmutil names it
+  KB=$(kmutil inspect -a arm64e 2>/dev/null | sed -nE 's/^boot kernel collection at (.*) \([0-9A-Fa-f-]+\):$/\1/p' | head -1)
+  KS=$KB
+fi
 REMOVING=0; RB=""; NEWKC=""; REMOVE_KC=0; CANDIDATE=""
 rollback_removal() {
   local failed=0 k b
@@ -42,8 +59,10 @@ trap 'die "uninstaller interrupted (signal TERM)"' TERM
 # SIP's filesystem protection makes the driver's files and the kernel collection read-only even for root: removal then
 # failed half-way ("Operation not permitted" on every bundle, then kmutil). The driver cannot load in that state either,
 # so stop before anything is touched and say how to get out of it.
+# Apple Silicon is exempt: /Library/Extensions and /Library/GPUBundles are root-writable there with SIP on (that is how
+# every third-party kext installs), and there is no OpenCore to re-apply a setting.
 SIPS=$(csrutil status 2>/dev/null)
-if printf '%s\n' "$SIPS" | grep -q 'status: enabled\.' || printf '%s\n' "$SIPS" | grep -q 'Filesystem Protections: enabled'; then
+if [ "$ARCH" = x86_64 ] && { printf '%s\n' "$SIPS" | grep -q 'status: enabled\.' || printf '%s\n' "$SIPS" | grep -q 'Filesystem Protections: enabled'; }; then
   die "System Integrity Protection is on, so macOS will not let the driver be removed (and the driver cannot load while it is on). Restart once so OpenCore applies its SIP setting again, then remove the driver again. Nothing was changed."
 fi
 BK=${1:-}
@@ -56,7 +75,11 @@ left=$(find "$EXT" -maxdepth 1 -name '*.kext' 2>/dev/null | while read -r x; do
   n=$(basename "$x" .kext); if [[ " $KEXTS " == *" $n "* ]]; then continue; fi
   [ -d "$x/Contents/MacOS" ] && echo "$x"
   done | wc -l | tr -d ' ')
-if [ "$left" = 0 ]; then
+if [ "$ARCH" = arm64 ]; then
+  # Apple Silicon: the auxiliary collection lives in the Preboot volume and only kernelmanagerd rebuilds it, after the
+  # kexts are gone from /Library/Extensions (below). A file an x86 install left in /Library/KernelCollections goes too.
+  REMOVE_KC=1
+elif [ "$left" = 0 ]; then
   REMOVE_KC=1
 else
   RB=$(mktemp -d /var/tmp/nullmoth-remove.XXXX) && [ -n "$RB" ] || die "cannot create the removal preflight directory"
@@ -69,7 +92,7 @@ else
   NEWKC="$KC.nullmoth-remove-new"; rm -f "$NEWKC" || die "cannot clear the removal candidate"
   kmutil create -n aux --volume-root / ${KARG[@]+"${KARG[@]}"} -B $KB -S $KS --repository "$RB/repo" -A "$NEWKC" -z >/dev/null 2>&1 || die "kmutil could not rebuild the collection"
   [ -s "$NEWKC" ] || die "kmutil produced no removal collection"
-  INS=$(kmutil inspect -a x86_64 -A "$NEWKC" 2>/dev/null) || die "cannot inspect the removal collection"
+  INS=$(kmutil inspect -a $KARCH -A "$NEWKC" 2>/dev/null) || die "cannot inspect the removal collection"
   printf '%s\n' "$INS" | grep -Eq 'com\.nullmoth|org\.hackintosh\.experimental\.NVPrimarySelector' && die "the removal collection still lists the NVIDIA driver or selector"
   # Other processes can move or delete files in /Library/KernelCollections between this check and the publish below.
   # A private copy of the verified collection lets the publish go ahead when the candidate there is gone.
@@ -106,9 +129,19 @@ else
   cp -p "$CANDIDATE" "$KC" || die "cannot publish the verified backup collection"
 fi
 if [ -f "$KC" ]; then
-  FINAL_INS=$(kmutil inspect -a x86_64 -A "$KC" 2>/dev/null) || die "cannot verify the published removal collection"
+  FINAL_INS=$(kmutil inspect -a $KARCH -A "$KC" 2>/dev/null) || die "cannot verify the published removal collection"
   printf '%s\n' "$FINAL_INS" | grep -Eq 'com\.nullmoth|org\.hackintosh\.experimental\.NVPrimarySelector' && die "the kernel collection still lists the NVIDIA driver or selector"
 fi
 REMOVING=0
+if [ "$ARCH" = arm64 ]; then
+  # Ask kernelmanagerd to rebuild the auxiliary collection without the removed kexts now. kmutil rebuild may ask for a
+  # confirmation, so its input is closed; when it does not finish, the kexts are already gone from disk and the rebuild
+  # can be run by hand after the restart. Nothing else of the driver remains either way.
+  if kmutil rebuild </dev/null >"$RB/rebuild.log" 2>&1; then echo "auxiliary kernel collection rebuilt without the driver"
+  else
+    echo "NOTE: kmutil rebuild did not finish (its output follows); after the restart run: sudo kmutil rebuild"
+    tail -10 "$RB/rebuild.log"
+  fi
+fi
 rm -rf "$RB"
 echo "Driver removed. Reboot now: sudo shutdown -r now"

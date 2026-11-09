@@ -115,6 +115,15 @@ void nvlog(const char *fmt, ...) {
 #endif
 }
 
+void nvlog_diag(const char *fmt, ...) {
+#if !NVMTL_RELEASE
+    char b[700]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
+    FILE *f = fopen(nvmtl_log_path(), "a"); if (f) { fprintf(f, "pid %d NVMTL: %s\n", getpid(), b); fclose(f); }
+#else
+    (void)fmt;
+#endif
+}
+
 #define NVMTL_OOM_STREAK      32
 #define NVMTL_OOM_COOLDOWN_NS (250ull * 1000ull * 1000ull)
 static _Atomic uint64_t g_oom_streak, g_oom_until;
@@ -141,12 +150,39 @@ static void nvmtl_alloc_failed(const char *what) {
           (unsigned long long)im, (unsigned long long)ig, (unsigned long long)(im - ig),
           (unsigned long long)(bytes >> 20), (unsigned long long)cb, (unsigned long long)cs, (unsigned long long)ca);
 }
+#if defined(NVMTL_APPLE_SILICON) || (defined(__arm64__) && !defined(NVMTL_IOACCEL_DEVICE))
+// NVMTL_APPLE_SILICON is set by build/arm64/build_plugin.sh for BOTH slices of the Apple Silicon bundle: the x86_64
+// slice there only ever runs under Rosetta, on the same kernel, so it needs the same device base as the arm64 one.
+// Apple Silicon has no IOAcceleratorFamily2, so there is no kernel plane for Metal's MTLIOAccelDevice to stand on
+// (its init opens IOAccelDevice2 / IOAccelSharedUserClient2 and maps their shared pages). Metal does not need that
+// class: _getMetalPluginClassForService only requires the plugin class to be a subclass of _MTLDevice, Metal's own
+// base (the AGX driver's device sits on it too, through IOGPUMetalDevice), and _MTLAddDevice then checks <MTLDevice>
+// and <MTLDeviceSPI> and runs initLimits / initFeatureQueries / initWorkarounds. So on arm64 this device derives from
+// _MTLDevice directly and answers the small device-driver surface itself (see "arm64 device" at the end of this file
+// and docs/ARM64-PORT-NOTES.md, "Accelerator design"). NVMTL_DEVICE_ARM64 marks every place that differs.
+#define NVMTL_DEVICE_ARM64 1
+@interface _MTLDevice : NSObject
+- (instancetype)init;
+@end
+@protocol MTLDeviceSPI <NSObject> @end
+@interface NVMTLDevice : _MTLDevice <MTLDevice, MTLDeviceSPI> {
+    mach_port_t _nvAccelPort;      // the IOAccelerator service Metal handed to initWithAcceleratorPort:
+    uint64_t    _nvRegistryID;     // its I/O registry entry ID, what -registryID answers
+    id          _nvAccelService;   // Metal's MTLIOAccelService wrapper, set through _setAcceleratorService:
+}
+@end
+#else
+#define NVMTL_DEVICE_ARM64 0
 @interface MTLIOAccelDevice : NSObject
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port;
 @end
 @protocol MTLDeviceSPI <NSObject> @end
 @interface NVMTLDevice : MTLIOAccelDevice <MTLDevice, MTLDeviceSPI>
 @end
+#endif
+// Test harness only (tools/arm64-probes/enumsim): with NVMTL_SIM_NO_GPU set, a debug build accepts the device without
+// NVK so Metal's enumeration and device setup can be exercised on a Mac that has no NVIDIA GPU. Never in a release.
+static bool nvmtl_sim_no_gpu(void) { return !NVMTL_RELEASE && getenv("NVMTL_SIM_NO_GPU") != NULL; }
 #import "NVMTLObjects.h"
 void nvmtl_vendor_compile_airs(NSDictionary<NSString *, NSString *> *airs,
                                NSDictionary<NSString *, NSString *> *stages);
@@ -616,6 +652,23 @@ static bool nvmtl_process_is_allowed(void)
     return ok;
 }
 
+@interface NVMTLFunction (NVMTLBitCodeHash)
+- (const void *)bitCodeHash;
+@end
+static void nvmtl_dump_air(id fnObj, const char *stage)
+{
+    static NSString *dir; static dispatch_once_t once;
+    dispatch_once(&once, ^{ const char *e = getenv("NVMTL_DUMP_AIR_DIR");
+        if (e && *e) { dir = @(e); [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                       nvlog_diag("dump air: the AIR of every new pipeline function goes to %s (diagnostic)", e); } });
+    if (!dir || ![fnObj isKindOfClass:[NVMTLFunction class]]) return;
+    NVMTLFunction *f = (NVMTLFunction *)fnObj; if (!f->_air.length) return;
+    const uint8_t *h = (const uint8_t *)[f bitCodeHash];
+    NSString *path = [NSString stringWithFormat:@"%@/%02x%02x%02x%02x%02x%02x%02x%02x.%s%s.ll", dir, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], stage, f->_fc.count ? ".fc" : ""];
+    static NSMutableSet *seen; static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+    os_unfair_lock_lock(&lk); if (!seen) seen = [NSMutableSet new]; const BOOL fresh = ![seen containsObject:path]; if (fresh) [seen addObject:path]; os_unfair_lock_unlock(&lk);
+    if (fresh) [f->_air writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
+}
 @implementation NVMTLDevice
 + (void)load {
     char me[1200], ts[40] = "?"; time_t now = time(NULL); struct tm tm;
@@ -653,8 +706,16 @@ static void nvmtl_install_hw_resource_pools(id dev)
 }
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port {
     nvlog("-[NVMTLDevice initWithAcceleratorPort:%u] in %s", port, getprogname());
+#if NVMTL_DEVICE_ARM64
+    self = [super init];
+    if (!self) { nvlog("  _MTLDevice init returned nil"); return nil; }
+    _nvAccelPort = port;
+    if (port) { IOObjectRetain(port); IORegistryEntryGetRegistryEntryID(port, &_nvRegistryID); }
+    nvlog("  arm64 device on _MTLDevice; accelerator registry ID 0x%llx", (unsigned long long)_nvRegistryID);
+#else
     self = [super initWithAcceleratorPort:port];
     if (!self) { nvlog("  super initWithAcceleratorPort: returned nil"); return nil; }
+#endif
     {   /* one GPU per process: the plugin runs a single Vulkan device, so a second Metal device on another vendor's
            accelerator (a PC with an NVIDIA card and an AMD or Intel GPU) is refused rather than given the wrong GPU */
         uint16_t mine = nvmtl_vk_set_accelerator(port), live = nvmtl_vk_vendor();
@@ -664,14 +725,14 @@ static void nvmtl_install_hw_resource_pools(id dev)
     if (!nvmtl_process_is_allowed()) { nvlog("  not allow-listed: no device for %s", getprogname()); return nil; }
     nvlog("MTLIOAccelDevice's initWithAcceleratorPort: -> %p", (__bridge void *)self);
     gNVMTLMainDevice = self;
-    nvmtl_install_hw_resource_pools(self);
+    if (!NVMTL_DEVICE_ARM64) nvmtl_install_hw_resource_pools(self);   // MTLIOAccelResourcePool needs the IOAccel device plane
     [self nvmtlProbeGPUPass];
     if (nvmtl_vk_init()) {
-        nvlog("  NVK did not come up in this process - refusing to be the Metal device for %s", getprogname());
-        return nil;
+        if (nvmtl_sim_no_gpu()) nvlog("  NVK is down but NVMTL_SIM_NO_GPU is set: keeping the device for the enumeration test");
+        else { nvlog("  NVK did not come up in this process - refusing to be the Metal device for %s", getprogname()); return nil; }
     }
     nvmtl_gl_caps_enable();
-    if (nvmtl_vk_vendor() == 0x10de) {   /* NVDEC/NVENC are NVIDIA engines reached through NVRM */
+    if (nvmtl_vk_vendor() == 0x10de && !nvmtl_sim_no_gpu()) {   /* NVDEC/NVENC are NVIDIA engines reached through NVRM */
         nvmtl_nvdec_register();
         nvmtl_nvenc_register();
         nvmtl_nvdec_hevc_register();
@@ -737,6 +798,14 @@ static void nvmtl_install_hw_resource_pools(id dev)
 static void nvmtl_zero_new_buffer(NVMTLBuffer *b, NSUInteger len);
 static __thread int gZeroSkip;
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)len options:(MTLResourceOptions)opt {
+    {   // census by storage mode (device buffers only, not heap sub-allocations): every 2^k buffers, count and bytes per mode
+        static _Atomic uint64_t n[4], bytes[4], total; const unsigned m = (unsigned)((opt & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift) & 3u;
+        atomic_fetch_add(&n[m], 1); atomic_fetch_add(&bytes[m], len); const uint64_t k = atomic_fetch_add(&total, 1) + 1;
+        if (k >= 256 && !(k & (k - 1)))
+            nvlog_diag("buffer modes: %llu device buffers - Shared %llu (%llu MB), Managed %llu (%llu MB), Private %llu (%llu MB), Memoryless %llu",
+                       (unsigned long long)k, (unsigned long long)n[0], (unsigned long long)(bytes[0] >> 20), (unsigned long long)n[1], (unsigned long long)(bytes[1] >> 20),
+                       (unsigned long long)n[2], (unsigned long long)(bytes[2] >> 20), (unsigned long long)n[3]);
+    }
     if (nvmtl_vk_init()) return nil;
     if (nvmtl_alloc_blocked()) return nil;
     NVMTLBuffer *b = [NVMTLBuffer new];
@@ -956,7 +1025,7 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     }
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
-    int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
+    int wantStex = NVMTL_USAGE_WRITES(d.usage);
     if (d.textureType == MTLTextureType2DMultisample || d.textureType == MTLTextureType2DMultisampleArray) {
         if (d.mipmapLevelCount != 1 || d.depth != 1) { nvlog("newTextureWithDescriptor: invalid multisample color descriptor"); return nil; }
         if (wantStex) { static _Atomic unsigned long msw; const unsigned long k = atomic_fetch_add(&msw, 1) + 1;
@@ -1123,7 +1192,7 @@ static char nvmtl_surface_cache_key;
     t->_fbo = nvmtl_desc_fbo(d);
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
-    int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
+    int wantStex = NVMTL_USAGE_WRITES(d.usage);
     NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
     // Failed BAR imports use a private image. Repeated wrappers of the same
@@ -1602,7 +1671,20 @@ static NVMTLFunction *nvmtl_empty_fragment(void) {
 MTLRenderPipelineDescriptor *nvmtl_gl_rewrite_descriptor(MTLRenderPipelineDescriptor *d, NSError **err);
 NSData *nvmtl_translate_samplers(NVMTLFunction *fn, NSDictionary *states, uint32_t a8, NSString **err);
 void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d);
+static _Atomic int g_pso_pending; static _Atomic uint64_t g_pso_n, g_pso_async_n;
+extern _Atomic unsigned nvmtl_flick_frame;
+static __thread int g_pso_async_ctx;
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err {
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); const unsigned f0 = atomic_load(&nvmtl_flick_frame);
+    id<MTLRenderPipelineState> ps = [self nvmtlRenderPipelineCore:d error:err];
+    const uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); const uint64_t n = atomic_fetch_add(&g_pso_n, 1) + 1;
+    static int psoLog = -1; if (psoLog < 0) { const char *e = getenv("NVMTL_PSO_LOG"); psoLog = e && *e == '1'; }
+    if (psoLog && f0 > 0)
+        nvlog_diag("pso: %s build %.1f ms frames %u->%u '%s' vs %s fs %s c0 fmt %lu%s [%llu built]", g_pso_async_ctx ? "async" : "SYNC", (double)(t1 - t0) / 1e6, f0, atomic_load(&nvmtl_flick_frame),
+                   d.label.UTF8String ?: "", d.vertexFunction.name.UTF8String ?: "-", d.fragmentFunction.name.UTF8String ?: "-", (unsigned long)d.colorAttachments[0].pixelFormat, ps ? "" : " FAILED", (unsigned long long)n);
+    return ps;
+}
+- (id<MTLRenderPipelineState>)nvmtlRenderPipelineCore:(MTLRenderPipelineDescriptor *)d error:(NSError **)err {
     if (err) *err = nil;
     // Work on a copy: some descriptor getters (vertexLinkedFunctions, ...) create their object on first read, and the
     // caller's descriptor then no longer equals a fresh one. Apple's GL keys its built-in (blit) pipelines by the
@@ -1614,6 +1696,37 @@ void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d);
     if (!vfn) return nvmtl_fail(err, @"pipeline: descriptor is missing a vertex function");
     int noFrag = ffn == nil;
     if (noFrag) ffn = nvmtl_empty_fragment();
+    if ([(id)ffn isKindOfClass:[NVMTLFunction class]]) {
+        static NSSet *drop; static dispatch_once_t once;
+        dispatch_once(&once, ^{ const char *e = getenv("NVMTL_NODEMOTE_FS"); NSMutableSet *ms = [NSMutableSet set];
+            if (e) for (NSString *t in [@(e) componentsSeparatedByString:@","]) if (t.length) [ms addObject:t.lowercaseString];
+            drop = ms; if (ms.count) nvlog_diag("nodemote: fragment shaders %s get their OpDemoteToHelperInvocation replaced by OpNop (diagnostic)", e); });
+        NVMTLFunction *f = (NVMTLFunction *)ffn;
+        { static NSDictionary *subst; static dispatch_once_t once2;
+          dispatch_once(&once2, ^{ const char *e = getenv("NVMTL_FS_SUBST"); NSMutableDictionary *md = [NSMutableDictionary dictionary];
+              if (e) for (NSString *t in [@(e) componentsSeparatedByString:@","]) { NSArray *kv = [t componentsSeparatedByString:@"="]; if (kv.count == 2) md[[kv[0] lowercaseString]] = [kv[1] lowercaseString]; }
+              subst = md; if (md.count) nvlog_diag("fs subst: %s (fragment SPIR-V replaced from ~/Library/Logs/nvmtl/fns/<hash>.spv, diagnostic)", e); });
+          if (subst.count && f->_spirv.length) {
+              const uint8_t *h = (const uint8_t *)[f bitCodeHash];
+              NSString *hs = [NSString stringWithFormat:@"%02x%02x%02x%02x", h[0], h[1], h[2], h[3]]; NSString *to = subst[hs];
+              if (to) @synchronized (f) {
+                  NSString *path = [NSHomeDirectory() stringByAppendingFormat:@"/Library/Logs/nvmtl/fns/%@.spv", to];
+                  NSData *rep = [NSData dataWithContentsOfFile:path];
+                  if (rep.length && ![rep isEqualToData:f->_spirv]) { f->_spirv = rep; nvlog_diag("fs subst: %s now runs the SPIR-V of %s (%lu bytes)", hs.UTF8String, to.UTF8String, (unsigned long)rep.length); }
+                  else if (!rep.length) nvlog_diag("fs subst: %s - no file %s", hs.UTF8String, path.UTF8String);
+              }
+          } }
+        if (drop.count && f->_spirv.length) {
+            const uint8_t *h = (const uint8_t *)[f bitCodeHash];
+            NSString *hs = [NSString stringWithFormat:@"%02x%02x%02x%02x", h[0], h[1], h[2], h[3]];
+            if ([drop containsObject:hs]) @synchronized (f) {
+                NSMutableData *m = [f->_spirv mutableCopy]; uint32_t *w = m.mutableBytes; const size_t n = m.length / 4; unsigned cnt = 0;
+                for (size_t i = 5; i < n;) { const uint32_t wc = w[i] >> 16, op = w[i] & 0xffff; if (!wc) break; if (op == 5380 && wc == 1) { w[i] = 0x00010000u; cnt++; } i += wc; }
+                if (cnt) { f->_spirv = m; nvlog_diag("nodemote: fs %s - %u demote(s) replaced", hs.UTF8String, cnt); }
+            }
+        }
+    }
+    nvmtl_dump_air(vfn, "vertex"); nvmtl_dump_air(ffn, "fragment");
     if (![(id)vfn isKindOfClass:[NVMTLFunction class]] || ![(id)ffn isKindOfClass:[NVMTLFunction class]])
         return nvmtl_fail(err, [NSString stringWithFormat:
             @"pipeline: REFUSED - these functions are not ours: vertex %s, fragment %s "
@@ -1794,17 +1907,33 @@ static NSOperationQueue *nvmtl_pipeline_compile_queue(void) {
 }
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d completionHandler:(MTLNewRenderPipelineStateCompletionHandler)h {
     MTLRenderPipelineDescriptor *snapshot = [d copy];
+    const uint64_t tq = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); const unsigned fq = atomic_load(&nvmtl_flick_frame); const int pend = atomic_fetch_add(&g_pso_pending, 1) + 1;
     [nvmtl_pipeline_compile_queue() addOperationWithBlock:^{ @autoreleasepool {
+        const uint64_t ts = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        g_pso_async_ctx = 1;
         NSError *e = nil; id<MTLRenderPipelineState> ps = [self newRenderPipelineStateWithDescriptor:snapshot error:&e];
+        g_pso_async_ctx = 0;
+        const uint64_t te = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); atomic_fetch_sub(&g_pso_pending, 1);
+        if (fq > 0 && getenv("NVMTL_PSO_LOG")) nvlog_diag("pso: async request at frame %u answered at frame %u: waited %.1f ms in the queue (%d pending when asked), built in %.1f ms, %.1f ms in all - vs %s fs %s [%llu async]",
+                               fq, atomic_load(&nvmtl_flick_frame), (double)(ts - tq) / 1e6, pend, (double)(te - ts) / 1e6, (double)(te - tq) / 1e6,
+                               snapshot.vertexFunction.name.UTF8String ?: "-", snapshot.fragmentFunction.name.UTF8String ?: "-", (unsigned long long)(atomic_fetch_add(&g_pso_async_n, 1) + 1));
         if (h) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ h(ps, e); });
     }}];
 }
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)o
                            completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)h {
     MTLRenderPipelineDescriptor *snapshot = [d copy];
+    const uint64_t tq = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); const unsigned fq = atomic_load(&nvmtl_flick_frame); const int pend = atomic_fetch_add(&g_pso_pending, 1) + 1;
     [nvmtl_pipeline_compile_queue() addOperationWithBlock:^{ @autoreleasepool {
+        const uint64_t ts = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        g_pso_async_ctx = 1;
         NSError *e = nil; MTLRenderPipelineReflection *reflection = nil;
         id<MTLRenderPipelineState> ps = [self newRenderPipelineStateWithDescriptor:snapshot options:o reflection:&reflection error:&e];
+        g_pso_async_ctx = 0;
+        const uint64_t te = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); atomic_fetch_sub(&g_pso_pending, 1);
+        if (fq > 0 && getenv("NVMTL_PSO_LOG")) nvlog_diag("pso: async request at frame %u answered at frame %u: waited %.1f ms in the queue (%d pending when asked), built in %.1f ms, %.1f ms in all - vs %s fs %s [%llu async]",
+                               fq, atomic_load(&nvmtl_flick_frame), (double)(ts - tq) / 1e6, pend, (double)(te - ts) / 1e6, (double)(te - tq) / 1e6,
+                               snapshot.vertexFunction.name.UTF8String ?: "-", snapshot.fragmentFunction.name.UTF8String ?: "-", (unsigned long long)(atomic_fetch_add(&g_pso_async_n, 1) + 1));
         if (h) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ h(ps, reflection, e); });
     }}];
 }
@@ -1999,6 +2128,7 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
         return nvmtl_fail(err, [NSString stringWithFormat:
             @"newComputePipelineState: REFUSED - this function is not ours: %s", object_getClassName(fn)]);
     NVMTLFunction *f = (NVMTLFunction *)fn;
+    nvmtl_dump_air(f, "kernel");
     if (f && f->_needsLink) { NSError *le = nil; id<MTLFunction> lk = nvmtl_link_stage(fn, nil, nil, &le); if (!lk) { if (err) *err = le; return nil; } f = (NVMTLFunction *)lk; fn = lk; }
     // Machine code compiled ahead of time (NVMTLSass.m), from the linker or looked up for this function, runs
     // instead of a Vulkan pipeline, which is then never built for it.
@@ -2124,11 +2254,13 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     if (hd.type == MTLHeapTypePlacement) {
         if (nvmtl_vk_heap_create(hd.size, hd.storageMode == MTLStorageModeShared, &h->_hm)) { nvlog("newHeapWithDescriptor: PLACEMENT %lu bytes FAILED", (unsigned long)hd.size); return nil; }
         nvlog("newHeapWithDescriptor: PLACEMENT %lu bytes (%s) -> %p", (unsigned long)hd.size, hd.storageMode == MTLStorageModeShared ? "shared" : "private", (__bridge void *)h);
+        { extern void nvmtl_heapwatch_note(void *, size_t); extern void nvmtl_vk_heap_adopt(nvk_heap *); if (hd.storageMode == MTLStorageModeShared) { nvmtl_vk_heap_adopt(&h->_hm); nvmtl_heapwatch_note(h->_hm.map, h->_hm.size); } }
         return h;
     }
     if (!getenv("NVMTL_NO_HEAP_ALIAS") && (hd.storageMode == MTLStorageModePrivate || hd.storageMode == MTLStorageModeShared))
         nvmtl_heap_back(h, hd.size, hd.storageMode == MTLStorageModeShared);
-    nvlog("newHeapWithDescriptor: %lu bytes -> %p", (unsigned long)hd.size, (__bridge void *)h);
+    { extern void nvmtl_heapwatch_note(void *, size_t); extern void nvmtl_vk_heap_adopt(nvk_heap *); if (hd.storageMode == MTLStorageModeShared && h->_hm.map) { nvmtl_vk_heap_adopt(&h->_hm); nvmtl_heapwatch_note(h->_hm.map, h->_hm.size); } }
+    nvlog("newHeapWithDescriptor: %lu bytes storage %d type %d hazard %d -> %p", (unsigned long)hd.size, (int)hd.storageMode, (int)hd.type, (int)hd.hazardTrackingMode, (__bridge void *)h);
     return h;
 }
 - (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)len options:(MTLResourceOptions)opt {
@@ -2143,7 +2275,7 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
     uint32_t mtl_type = (uint32_t)d.textureType;
     uint32_t layers = nvmtl_vk_layers_for_desc(mtl_type, (uint32_t)d.arrayLength, (uint32_t)d.depth);
     if (nvmtl_vk_image_size_align((uint32_t)d.width, (uint32_t)d.height, depth ? dvk : vkf, (uint32_t)d.mipmapLevelCount, mtl_type, layers, depth,
-                                  (d.usage & MTLTextureUsageShaderWrite) != 0 && !a8, &sz, &al)) { sz = d.width * d.height * (bpp ? bpp : 4); al = 256; }
+                                  NVMTL_USAGE_WRITES(d.usage) && !a8, &sz, &al)) { sz = d.width * d.height * (bpp ? bpp : 4); al = 256; }
     MTLSizeAndAlign r = { sz, al }; return r;
 }
 - (id<MTLIndirectCommandBuffer>)newIndirectCommandBufferWithDescriptor:(MTLIndirectCommandBufferDescriptor *)d
@@ -2281,6 +2413,74 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 - (NSUInteger)gpuCoreCount { uint32_t sm = 0; nvmtl_vk_limits(NULL, NULL, NULL, NULL, &sm);
     if (!sm) { static int said; if (!said++) nvlog("gpuCoreCount: NVK reported no SM count; answering 1 so MPS divides by something real"); return 1; }
     return sm; }
+
+#if NVMTL_DEVICE_ARM64
+// ---- arm64 device: the driver-side surface a plugin device must answer itself when it does not sit on MTLIOAccelDevice.
+// Measured in Metal.framework (macOS 27, arm64e): MTLIOAccelService sends _setAcceleratorService: right after init;
+// MTLIOAccelDevice answered isHeadless / isLowPower / hasUnifiedMemory / isRemovable from bits 11 / 10 / 12 / 13 of
+// IOAccelDevice2's 64-byte config, registryID from IORegistryEntryGetRegistryEntryID, location from isRemovable /
+// isSlotted / isBuiltIn, and the peer group from get_config. On Apple Silicon the card is always an external, headless
+// (no NVIDIA display head) GPU behind Thunderbolt; the PCI parent says whether it is tunnelled.
+- (io_registry_entry_t)nvmtlPCIParent {   // the IOPCIDevice above the accelerator, or 0; caller releases
+    io_registry_entry_t e = _nvAccelPort, parent = 0;
+    if (!e) return 0;
+    IOObjectRetain(e);
+    for (int depth = 0; depth < 4; depth++) {
+        if (IORegistryEntryGetParentEntry(e, kIOServicePlane, &parent) != KERN_SUCCESS) { IOObjectRelease(e); return 0; }
+        IOObjectRelease(e); e = parent;
+        if (IOObjectConformsTo(e, "IOPCIDevice")) return e;
+    }
+    IOObjectRelease(e); return 0;
+}
+- (BOOL)nvmtlIsTunnelled {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    io_registry_entry_t pci = [self nvmtlPCIParent]; BOOL t = NO;
+    if (pci) {
+        CFTypeRef v = IORegistryEntryCreateCFProperty(pci, CFSTR("IOPCITunnelled"), kCFAllocatorDefault, 0);
+        t = v && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)v);
+        if (v) CFRelease(v);
+        IOObjectRelease(pci);
+    }
+    cached = t ? 1 : 0;
+    return t;
+}
+- (uint64_t)registryID { return _nvRegistryID; }
+- (mach_port_t)acceleratorPort { return _nvAccelPort; }
+- (void)_setAcceleratorService:(id)s { _nvAccelService = s; }
+- (id)_acceleratorService { return _nvAccelService; }
+- (BOOL)isHeadless { return YES; }
+- (BOOL)isLowPower { return NO; }
+- (BOOL)isRemovable { return [self nvmtlIsTunnelled]; }
+- (BOOL)isBuiltIn { return NO; }
+- (BOOL)isSlotted { return NO; }
+- (MTLDeviceLocation)location { return [self nvmtlIsTunnelled] ? MTLDeviceLocationExternal : MTLDeviceLocationSlot; }
+- (NSUInteger)locationNumber { return 0; }
+- (uint64_t)maxTransferRate {   // bytes per second of the PCIe link the card negotiated (0 when unknown), as Metal reports it
+    io_registry_entry_t pci = [self nvmtlPCIParent]; uint64_t rate = 0;
+    if (pci) {
+        CFTypeRef v = IORegistryEntryCreateCFProperty(pci, CFSTR("IOPCIExpressLinkStatus"), kCFAllocatorDefault, 0);
+        int64_t st = 0;
+        if (v && CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberSInt64Type, &st)) {
+            unsigned speed = (unsigned)(st & 0xf), width = (unsigned)((st >> 4) & 0x3f);
+            static const uint64_t gts[] = { 0, 2500000000ull, 5000000000ull, 8000000000ull, 16000000000ull, 32000000000ull };
+            if (speed >= 1 && speed <= 5 && width) rate = gts[speed] * width * (speed >= 3 ? 128 : 8) / (speed >= 3 ? 130 : 10) / 8;
+        }
+        if (v) CFRelease(v);
+        IOObjectRelease(pci);
+    }
+    return rate;
+}
+- (uint64_t)peerGroupID { return 0; }
+- (uint32_t)peerIndex { return 0; }
+- (uint32_t)peerCount { return 0; }
+- (uint64_t)sharedMemorySize { return 0; }
+- (void)updateGPUSelectionProperties {}
+- (BOOL)supportLazyInitialization { return NO; }
+- (BOOL)lazyInitialize { return YES; }
+- (NSUInteger)numCommandBuffers { return 0; }
+- (void)dealloc { if (_nvAccelPort) IOObjectRelease(_nvAccelPort); }
+#endif
 
 @end
 

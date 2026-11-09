@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key><string>NVAccelArm</string>
+	<key>CFBundleIdentifier</key><string>com.nullmoth.NVAccelArm</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundleName</key><string>NVAccelArm</string>
+	<key>CFBundlePackageType</key><string>KEXT</string>
+	<key>CFBundleShortVersionString</key><string>0.1</string>
+	<key>CFBundleVersion</key><string>0.1</string>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOGraphicsFamily</key><string>1.0.0b1</string>
+		<key>com.apple.iokit.IOPCIFamily</key><string>1.0.0b1</string>
+		<key>com.apple.kpi.iokit</key><string>8.0</string>
+		<key>com.apple.kpi.libkern</key><string>8.0</string>
+		<key>com.apple.kpi.mach</key><string>8.0</string>
+		<key>com.apple.kpi.bsd</key><string>8.0</string>
+	</dict>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>NVAccel</key>
+		<dict>
+			<key>CFBundleIdentifier</key><string>com.nullmoth.NVAccelArm</string>
+			<!-- the class is named NVAccel: NVK and the Metal plugin match that name (see NVAccelArm.cpp) -->
+			<key>IOClass</key><string>NVAccel</string>
+			<key>IOProviderClass</key><string>IOPCIDevice</string>
+			<!-- any NVIDIA display-class function, as the x86 NVAccel; NVRM decides what it supports -->
+			<key>IOPCIPrimaryMatch</key><string>0x000010de&amp;0x0000ffff</string>
+			<key>IOPCIClassMatch</key><string>0x03000000&amp;0xff000000</string>
+			<key>IOMatchCategory</key><string>IOAccelerator</string>
+			<key>IOProbeScore</key><integer>100</integer>
+			<!-- an eGPU is a Thunderbolt-tunnelled PCI device; IOPCIFamily matches those only to drivers that say so -->
+			<key>IOPCITunnelCompatible</key><true/>
+			<key>MetalPluginName</key><string>../../../Library/GPUBundles/NVMTLDriver</string>
+			<key>MetalPluginClassName</key><string>NVMTLDevice</string>
+		</dict>
+		<key>NVAccelSim</key>
+		<dict>
+			<!-- no GPU needed: boot-arg nvaccelsim=1 publishes the plugin on IOResources for the enumeration test -->
+			<key>CFBundleIdentifier</key><string>com.nullmoth.NVAccelArm</string>
+			<key>IOClass</key><string>NVAccel</string>
+			<key>IOProviderClass</key><string>IOResources</string>
+			<key>IOMatchCategory</key><string>NVAccelSim</string>
+			<key>IOProbeScore</key><integer>0</integer>
+		</dict>
+	</dict>
+</dict>
+</plist>

@@ -1,0 +1,31 @@
+# x86_64-apple-darwin.cross: meson cross file for building the x86_64 slice of NVK on an Apple Silicon Mac
+# (build_nvk_x86_64.sh). Compilers are Apple's clang through xcrun with -arch x86_64; rustc targets
+# x86_64-apple-darwin. The Rust bindgen step derives --target=x86_64-apple-darwin from the rust command.
+# Host-only helper programs (mesa_clc, vtn_bindgen2, bindgen, cbindgen, glslangValidator, python) are looked up
+# with native : true by Mesa's meson files, so they come from PATH as arm64 binaries and run on the host.
+[binaries]
+c = ['xcrun', 'clang', '-arch', 'x86_64']
+cpp = ['xcrun', 'clang++', '-arch', 'x86_64']
+objc = ['xcrun', 'clang', '-arch', 'x86_64']
+objcpp = ['xcrun', 'clang++', '-arch', 'x86_64']
+rust = ['rustc', '--target', 'x86_64-apple-darwin']
+# meson builds rustc's linker command from the C compiler list; with xcrun first it would run
+# `xcrun <objects> clang -arch x86_64`, which fails. Name the (single-word) Apple clang shim instead; rustc adds
+# -arch x86_64 itself for the x86_64-apple-darwin target.
+rust_ld = '/usr/bin/clang'
+ar = 'ar'
+strip = 'strip'
+
+[properties]
+# Rosetta runs x86_64 test binaries directly (meson's compiler sanity checks and run checks).
+needs_exe_wrapper = false
+# Keep Homebrew's arm64-only .pc files (lua, etc.) away from the x86_64 host-machine dependency lookup. Everything
+# NVK links (zlib, IOKit/CoreFoundation) is found in the SDK without pkg-config.
+pkg_config_libdir = ['/nonexistent/pkgconfig']
+bindgen_clang_arguments = ['--target=x86_64-apple-darwin']
+
+[host_machine]
+system = 'darwin'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'

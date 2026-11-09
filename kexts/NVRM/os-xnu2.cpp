@@ -18,7 +18,9 @@
 #include <sys/fcntl.h>
 #include <sys/uio.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
+#if NV_XNU_ACPI
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
+#endif
 #include <sys/proc.h>
 #include <sys/kauth.h>
 #include <libkern/crypto/sha1.h>
@@ -45,15 +47,15 @@ static const char *nv_xnu_fw_path(nv_firmware_type_t t, nv_firmware_chip_family_
 }
 
 #define TRC do { static bool _t = false; if (!_t) { _t = true; kprintf("NVRM-xnu: >%s\n", __func__); } } while (0)
-static inline void nvx2_memset(void *d, int c, size_t n) { __asm__ __volatile__("rep stosb" : "+D"(d), "+c"(n) : "a"(c) : "memory"); }
-static inline void nvx2_memcpy(void *d, const void *s, size_t n) { __asm__ __volatile__("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory"); }
+static inline void nvx2_memset(void *d, int c, size_t n) { nv_xnu_memset(d, c, n); }
+static inline void nvx2_memcpy(void *d, const void *s, size_t n) { nv_xnu_memcpy(d, s, n); }
 
 extern "C" {
 
 NvBool NV_API_CALL os_check_access(RsAccessRight accessRight) { TRC; return NV_TRUE; }
 NvU32  NV_API_CALL os_get_current_process_flags(void) { TRC; return 0; }
-NvBool NV_API_CALL nv_requires_dma_remap(nv_state_t *nv) { TRC; return NV_FALSE; }
-static NvU32 nv_xnu_dma_bits = 64;
+// nv_requires_dma_remap, nv_dma_map_alloc and the rest of the bus-address translation live in nv_xnu_dma.cpp.
+NvU32 nv_xnu_dma_bits = 64;
 void   NV_API_CALL nv_set_dma_address_size(nv_state_t *nv, NvU32 bits) { TRC; nv_xnu_dma_bits = bits; kprintf("NVRM-xnu:   dma address size %u bits\n", bits); }
 
 struct nv_xnu_alloc { IOBufferMemoryDescriptor *md; void *va; NvU64 page_size; NvU64 bytes; NvU32 page_count; NvBool contig; NvU32 cache;
@@ -437,14 +439,18 @@ static void nv_pm_init(void)
     if (nv_pm_lock) return;
     IOSimpleLock *l = IOSimpleLockAlloc(); if (!l) return;
     if (!OSCompareAndSwapPtr(NULL, l, (void * volatile *)&nv_pm_lock)) { IOSimpleLockFree(l); return; }
-    NvU64 pa[2] = { 0x5000, 0x9000 }, pc[1] = { 0x100000 }, off = 0;
-    nv_xnu_alloc A; nvx2_memset(&A, 0, sizeof A); A.ptes = pa; A.nptes = 2; A.bytes = 0x2000; A.contig = NV_FALSE;
-    nv_xnu_alloc C; nvx2_memset(&C, 0, sizeof C); C.ptes = pc; C.nptes = 1; C.bytes = 0x3000; C.contig = NV_TRUE;
-    bool ok = nv_pm_match(&A, 0x9010, 0x20, &off) && off == 0x1010
-           && !nv_pm_match(&A, 0x5ff0, 0x20, &off)
-           && !nv_pm_match(&A, 0x7000, 0x10, &off)
-           && nv_pm_match(&C, 0x102000, 0x1000, &off) && off == 0x2000
-           && !nv_pm_match(&C, 0x102800, 0x1000, &off);
+    // The probe pages are multiples of the OS page: 4 KB on Intel, 16 KB on Apple Silicon. Written as 0x5000/0x9000/0x2000
+    // the self-test failed on a 16 KB kernel, nv_pm_ok() stayed false, and every kernel mapping the RM asked for was
+    // refused ("osMapSystemMemory: failed to create system memory kernel mapping", GSP message queue init, 2026-11-03).
+    const NvU64 PS = PAGE_SIZE;
+    NvU64 pa[2] = { 5 * PS, 9 * PS }, pc[1] = { 0x100000 }, off = 0;
+    nv_xnu_alloc A; nvx2_memset(&A, 0, sizeof A); A.ptes = pa; A.nptes = 2; A.bytes = 2 * PS; A.contig = NV_FALSE;
+    nv_xnu_alloc C; nvx2_memset(&C, 0, sizeof C); C.ptes = pc; C.nptes = 1; C.bytes = 3 * PS; C.contig = NV_TRUE;
+    bool ok = nv_pm_match(&A, 9 * PS + 0x10, 0x20, &off) && off == PS + 0x10
+           && !nv_pm_match(&A, 6 * PS - 0x10, 0x20, &off)
+           && !nv_pm_match(&A, 7 * PS, 0x10, &off)
+           && nv_pm_match(&C, 0x100000 + 2 * PS, PS, &off) && off == 2 * PS
+           && !nv_pm_match(&C, 0x100000 + 2 * PS + PS / 2, PS, &off);
     nv_pm_selftest = ok ? "ok (2 hit, 3 miss)" : "FAILED — physmap aliasing is OFF";
     kprintf("NVRM-xnu: PHYSMAP armed, selftest %s\n", nv_pm_selftest);
 }
@@ -514,6 +520,17 @@ extern "C" bool nv_pm_is_gpu_fb(NvU64 start, NvU64 size)
     const NvU64 b = nv->bars[NV_GPU_BAR_INDEX_FB].cpu_address, s = nv->bars[NV_GPU_BAR_INDEX_FB].size;
     return b && s && start >= b && start + size <= b + s && start + size >= start;
 }
+// BAR1 (the VRAM window) or BAR2 (the RM's aperture into VRAM): memory the RM reads and writes like RAM, with the
+// unaligned accesses that implies. BAR0 (registers) is not included.
+extern "C" bool nv_pm_is_gpu_aperture(NvU64 start, NvU64 size)
+{
+    nv_state_t *nv = nv_xnu_gpu_state(); if (!nv) return false;
+    for (int i = NV_GPU_BAR_INDEX_FB; i <= NV_GPU_BAR_INDEX_IMEM; i++) {
+        NvU64 b = nv->bars[i].cpu_address, sz = nv->bars[i].size;
+        if (b && sz && start >= b && start + size <= b + sz && start + size >= start) return true;
+    }
+    return false;
+}
 extern "C" bool nv_pm_is_gpu(NvU64 start, NvU64 size)
 {
     nv_state_t *nv = nv_xnu_gpu_state(); if (!nv) return false;
@@ -580,6 +597,83 @@ static int nv_pm_sysctl SYSCTL_HANDLER_ARGS
 }
 SYSCTL_PROC(_debug, OID_AUTO, nvrm_physmap, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, nv_pm_sysctl, "A",
             "batch 47: RAM mapped by physical address — aliased, deferred, pinned, foreign, refused");
+// debug.nvrm_allocs (root): every live RM system-memory allocation with its physical runs, so a fabric panic's ADDR
+// (AMCC AFERRLOG, e.g. 0x1052168dc00) can be matched to an owner after the reboot: tools/arm64-probes/cp-watch.sh
+// snapshots it every 2 s next to the ring. One line per allocation: pid, size, cache type, contiguity, then
+// "phys+len" runs (consecutive 4 KB pages coalesced). Built under nv_pm_lock into a 1 MB buffer, copied out after.
+static uint32_t nv_xnu_devmem_mode(void);
+static unsigned nv_devmem_allocs = 0;
+// live user-page pins (os_lock_user_pages), listed by the allocs sysctl next to the RM allocations
+struct nv_xnu_upin { NvU32 magic; IOMemoryDescriptor *md; NvU64 page_count; };
+static const int kNvPinListCap = 512;
+static struct nv_xnu_upin *nv_pin_list[kNvPinListCap]; static int nv_pin_list_n = 0; static IOSimpleLock *nv_pin_lock = NULL;
+static void nv_pin_track(struct nv_xnu_upin *p, bool add)
+{
+    if (!nv_pin_lock) nv_pin_lock = IOSimpleLockAlloc();
+    if (!nv_pin_lock) return;
+    IOSimpleLockLock(nv_pin_lock);
+    if (add) { if (nv_pin_list_n < kNvPinListCap) nv_pin_list[nv_pin_list_n++] = p; }
+    else for (int i = 0; i < nv_pin_list_n; i++) if (nv_pin_list[i] == p) { nv_pin_list[i] = nv_pin_list[--nv_pin_list_n]; break; }
+    IOSimpleLockUnlock(nv_pin_lock);
+}
+static int nv_allocs_sysctl SYSCTL_HANDLER_ARGS
+{
+    // readable by everyone since 0.308.11xx: cp-watch.sh snapshots it every 2 s without a root shell, so an AMCC
+    // panic's ADDR can be matched after the reboot (docs items 21, 23, 25)
+    const size_t cap = 1024 * 1024; char *buf = (char *)IOMalloc(cap); if (!buf) return ENOMEM;
+    size_t h = 0; int w; unsigned listed = 0, cut = 0;
+    w = snprintf(buf + h, cap - h, "# devmem mode %u, %u device-mapped allocation(s)\n", nv_xnu_devmem_mode(), nv_devmem_allocs);
+    if (w > 0) h += (size_t)w;
+    if (nv_pm_lock) IOSimpleLockLock(nv_pm_lock);
+    for (nv_xnu_alloc *a = nv_pm_head; a; a = a->next) {
+        if (a->freed) continue;
+        listed++;
+        if (h > cap - 4096) { cut++; continue; }
+        w = snprintf(buf + h, cap - h, "pid %d %llu KB cache %u contig %u:", a->owner_pid, (unsigned long long)(a->bytes >> 10), a->cache, (unsigned)a->contig);
+        if (w > 0) h += (size_t)w;
+        if (a->ptes && a->nptes) {
+            NvU64 run = a->ptes[0], len = a->contig ? a->bytes : PAGE_SIZE;
+            for (NvU32 i = 1; i < a->nptes; i++) {
+                if (a->ptes[i] == run + len) { len += PAGE_SIZE; continue; }
+                w = snprintf(buf + h, cap - h, " 0x%llx+0x%llx", (unsigned long long)run, (unsigned long long)len);
+                if (w > 0) h += (size_t)w;
+                if (h > cap - 256) break;
+                run = a->ptes[i]; len = PAGE_SIZE;
+            }
+            w = snprintf(buf + h, cap - h, " 0x%llx+0x%llx", (unsigned long long)run, (unsigned long long)len);
+            if (w > 0) h += (size_t)w;
+        }
+        w = snprintf(buf + h, cap - h, "\n"); if (w > 0) h += (size_t)w;
+    }
+    if (nv_pm_lock) IOSimpleLockUnlock(nv_pm_lock);
+    if (nv_pin_lock) {
+        IOSimpleLockLock(nv_pin_lock);
+        for (int i = 0; i < nv_pin_list_n && h < cap - 4096; i++) {
+            struct nv_xnu_upin *p = nv_pin_list[i];
+            w = snprintf(buf + h, cap - h, "pin %llu pages:", (unsigned long long)p->page_count); if (w > 0) h += (size_t)w;
+            NvU64 run = 0, len = 0;
+            for (NvU64 off = 0; off < p->page_count * PAGE_SIZE && h < cap - 256; off += PAGE_SIZE) {
+                const addr64_t ph = p->md->getPhysicalSegment((IOByteCount)off, NULL, kIOMemoryMapperNone);
+                if (len && ph == run + len) { len += PAGE_SIZE; continue; }
+                if (len) { w = snprintf(buf + h, cap - h, " 0x%llx+0x%llx", (unsigned long long)run, (unsigned long long)len); if (w > 0) h += (size_t)w; }
+                run = ph; len = PAGE_SIZE;
+            }
+            if (len) { w = snprintf(buf + h, cap - h, " 0x%llx+0x%llx", (unsigned long long)run, (unsigned long long)len); if (w > 0) h += (size_t)w; }
+            w = snprintf(buf + h, cap - h, "\n"); if (w > 0) h += (size_t)w;
+        }
+        IOSimpleLockUnlock(nv_pin_lock);
+    }
+    w = snprintf(buf + h, cap - h, "# %u live allocation(s), %u not shown (buffer full), %d live pin(s)\n", listed, cut, nv_pin_list_n);
+    if (w > 0) h += (size_t)w;
+    if (h >= cap) h = cap - 1;
+    buf[h] = 0;
+    int err = SYSCTL_OUT(req, buf, h + 1);
+    IOFree(buf, cap);
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nvrm_allocs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, nv_allocs_sysctl, "A",
+            "live RM system-memory allocations and user-page pins with physical runs");
+static bool nv_allocs_registered = false;
 static bool nv_pm_registered = false;
 
 #include <pexpert/pexpert.h>
@@ -642,7 +736,7 @@ static const char *const nv_pv_kind[] = { "?", "BAD-PMAP", "MANAGED-LOST", "MANA
 struct nv_pv_ev { NvU64 t_ms, val, phys; uint32_t ppn, kind; uint8_t raw[32]; };
 static nv_pv_ev nv_pv_first, nv_pv_ring[16]; static unsigned nv_pv_ring_n;
 
-static bool nv_pv_pmap_ok(uint64_t v) { return v == 0 || (v >= 0xffffff8000000000ULL && !(v & 7)); }
+static bool nv_pv_pmap_ok(uint64_t v) { return v == 0 || (v >= NV_XNU_KERNEL_VA_MIN && !(v & 7)); }
 
 static void nv_pv_record(uint32_t kind, uint32_t ppn, uint64_t val, volatile const uint8_t *at)
 {
@@ -1089,6 +1183,33 @@ static void nv_pv_start(void)
     kprintf("NVRM-xnu: PV-SENTINEL armed: pages 0x%x managed %llu detect-only\n", nv_pv_last, nv_pv_managed_n);
 }
 
+// nvrmdevmem=1: map the RM's uncached/write-combined system memory as Device memory (kIOMapInhibitCache /
+// kIOMapWriteCombineCache), the fix for the AMCC panics of docs item 23. OFF by default since 0.308.1035 panicked twice
+// within 10-18 minutes of boot, the second time with nothing using the card: `pmap_recycle_page: page ... is referenced
+// @pmap_data.c:2287` in a kernel_task thread with no kext frame (docs item 24). Until that is understood the default is
+// the cacheable mapping of item 2 (and the AMCC exposure of item 23).
+// nvrmdevmem: 0 (default) cacheable; 1 = UNCACHED -> kIOMapInhibitCache, WRITECOMBINED -> kIOMapWriteCombineCache (0.308.1035);
+// 2 = kIOMapWriteCombineCache for both; 3 = kIOMapInhibitCache for both. The ring says which mode is in force.
+static uint32_t nv_xnu_devmem_mode(void)
+{
+    static int v = -1;
+    if (v < 0) { uint32_t b = 0; if (!PE_parse_boot_argn("nvrmdevmem", &b, sizeof b)) b = 0; v = (int)(b > 3 ? 1 : b);
+                 kprintf("NVRM-xnu: RM uncached/write-combined system memory is mapped %s (nvrmdevmem=%u)\n",
+                         v == 0 ? "CACHEABLE (default)" : v == 1 ? "Inhibit/WriteCombine (Device)" : v == 2 ? "WriteCombine for both (Device-GRE)" : "Inhibit for both (Device-nGnRnE)", b); }
+    return (uint32_t)v;
+}
+static bool nv_xnu_keep_cached(void) { return nv_xnu_devmem_mode() == 0; }
+static IOOptionBits nv_xnu_devmem_opts(NvU32 cache_type)
+{
+    if (cache_type != NV_MEMORY_UNCACHED && cache_type != NV_MEMORY_WRITECOMBINED) return 0;
+    switch (nv_xnu_devmem_mode()) {
+    case 1: return cache_type == NV_MEMORY_UNCACHED ? kIOMapInhibitCache : kIOMapWriteCombineCache;
+    case 2: return kIOMapWriteCombineCache;
+    case 3: return kIOMapInhibitCache;
+    default: return 0;
+    }
+}
+extern "C" bool nv_xnu_keep_cached_map(void) { return nv_xnu_keep_cached(); }
 NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 page_size, NvBool contiguous, NvU32 cache_type,
                                      NvBool zeroed, NvBool unencrypted, NvS32 node_id, NvU64 *pte_array, void **priv_data)
 {
@@ -1097,8 +1218,28 @@ NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 pag
             page_count, page_size, contiguous, cache_type, zeroed, bytes >> 10);
     IOOptionBits opts = kIODirectionInOut | kIOMemoryKernelUserShared;
     if (contiguous || page_size > PAGE_SIZE) opts |= kIOMemoryPhysicallyContiguous;
-    if (cache_type == NV_MEMORY_UNCACHED) opts |= kIOMapInhibitCache;
-    else if (cache_type == NV_MEMORY_WRITECOMBINED) opts |= kIOMapWriteCombineCache;
+    // arm64: kIOMapInhibitCache is Device memory (nGnRnE), where an unaligned access is a data abort; the RM does
+    // unaligned writes into "uncached" system memory (the video engine log buffer panicked gpuStateLoad on
+    // 2026-11-03). Normal non-cacheable (what IOKit calls write-combined) is what Linux uses for these on ARM.
+    // arm64: both kIOMapInhibitCache and kIOMapWriteCombineCache gave Device-type mappings here (measured: an 8-byte
+    // store at offset 4 of the video-engine log buffer was an alignment abort under either), and the RM makes
+    // unaligned accesses to its "uncached" system memory. Apple's PCIe DMA is coherent with the CPU caches (tinygrad's
+    // driver lets the GSP DMA into plain cacheable IOBufferMemoryDescriptors), so on arm64 the RM's uncached and
+    // write-combined system memory is simply cacheable, as Linux does on coherent ARM platforms.
+    // 2026-11-04, panic #11 (the fifth AMCC UNEXP_RT_HIT_DIR, ADDR in no listed allocation, with No-Snoop and
+    // Relaxed Ordering off and every kernel-side aperture coherent): the alignment aborts above were BAR2
+    // (docs item 2), not RAM, and the RM libraries are -mstrict-align since 0.307.1329. What the RM asks for
+    // UNCACHED/WRITECOMBINED is exactly what the GSP or an engine may access non-coherently (sysmembar flush
+    // page, GSP notify-op/state-monitor pages, libos init arguments, video trace ring); a cacheable mapping of
+    // those lets a CPU hold the line (a speculative fetch is enough) and the fabric panics on the next
+    // non-coherent access. Device memory can never be in a CPU cache, and IOKit applies the attribute to the
+    // physical aperture alias as well. Opt-in with nvrmdevmem=1 (see nv_xnu_keep_cached: two pmap_recycle_page panics).
+    if (!NV_XNU_ARM64) {
+        if (cache_type == NV_MEMORY_UNCACHED) opts |= kIOMapInhibitCache;
+        else if (cache_type == NV_MEMORY_WRITECOMBINED) opts |= kIOMapWriteCombineCache;
+    } else opts |= nv_xnu_devmem_opts(cache_type);
+    if (NV_XNU_ARM64 && (cache_type == NV_MEMORY_UNCACHED || cache_type == NV_MEMORY_WRITECOMBINED))
+        kprintf("NVRM-xnu: devmem alloc #%u: %llu KB cache %u opts 0x%x\n", ++nv_devmem_allocs, bytes >> 10, cache_type, (unsigned)opts);
     uint64_t mask = (nv_xnu_dma_bits >= 64) ? 0xFFFFFFFFFFFFF000ULL : ((1ULL << nv_xnu_dma_bits) - 1) & ~0xFFFULL;
     IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, opts, (mach_vm_size_t)bytes, mask);
     // the request's shape rides in the failure line: 1.14.5-1.14.7 reports logged hundreds of these (8100, 9800, 10240 KB)
@@ -1124,6 +1265,7 @@ NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 pag
     if (a->ptes) { for (NvU32 i = 0; i < n; i++) a->ptes[i] = pte_array[i]; a->nptes = n; }
     nv_pm_init();
     if (!nv_pm_registered && nv_pm_lock && nv_diag_on()) { nv_pm_registered = true; sysctl_register_oid(&sysctl__debug_nvrm_physmap); }
+    if (!nv_allocs_registered && nv_pm_lock) { nv_allocs_registered = true; sysctl_register_oid(&sysctl__debug_nvrm_allocs); }
     nv_pm_link(a);
     if (nv_diag_on()) nv_pv_start();   // detect-only page sentinel thread from the class-F panic hunt
     *priv_data = a;
@@ -1183,12 +1325,6 @@ void NV_API_CALL nv_free_kernel_mapping(nv_state_t *nv, void *pAllocPrivate, voi
     if (pPrivate) nv_pm_alias_drop(pPrivate);
 }
 
-NV_STATUS NV_API_CALL nv_dma_map_alloc(nv_dma_device_t *dev, NvU64 page_count, NvU64 *va_array, NvBool contig, NvBool cache_type, void **priv)
-{
-    kprintf("NVRM-xnu: >nv_dma_map_alloc pages=%llu contig=%u first=0x%llx (identity)\n", page_count, contig, va_array ? va_array[0] : 0);
-    *priv = NULL; return NV_OK;
-}
-NV_STATUS NV_API_CALL nv_dma_unmap_alloc(nv_dma_device_t *dev, NvU64 page_count, NvU64 *va_array, void **priv) { TRC; return NV_OK; }
 
 // What we shipped, by name. The card verifies the signature on a GSP image itself, so this is not an
 // authorisation check; it is how the driver notices that the image on disk is not the one the package
@@ -1226,6 +1362,15 @@ const void *NV_API_CALL nv_get_firmware(nv_state_t *nv, nv_firmware_type_t fw_ty
     vfs_context_t ctx = vfs_context_current();
     vnode_t vp = NULL;
     int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
+    // With the enclosure plugged at boot the kext matches the card before the Data volume is mounted, and the
+    // firmware under /Library is ENOENT for a while; go(2) runs on its own thread, so wait for it (up to 300 s: a
+    // panic reboot mounted the Data volume at settle + 110 s and 90 s was not enough, 2026-11-04 11:50) instead of
+    // failing the adapter until someone reruns go (2026-11-04 02:51).
+    for (int tries = 0; err == ENOENT && tries < 600; tries++) {
+        if (tries == 0) kprintf("NVRM-xnu:   %s not there yet (boot?), waiting for it\n", path);
+        IOSleep(500);
+        err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
+    }
     if (err) { kprintf("NVRM-xnu:   vnode_open failed %d\n", err); return NULL; }
     struct vnode_attr va; VATTR_INIT(&va); VATTR_WANTED(&va, va_data_size);
     if (vnode_getattr(vp, &va, ctx) != 0) { kprintf("NVRM-xnu:   vnode_getattr failed\n"); vnode_close(vp, FREAD, ctx); return NULL; }
@@ -1415,6 +1560,7 @@ void  NV_API_CALL nv_get_disp_smmu_stream_ids(nv_state_t *nv, NvU32 *a, NvU32 *b
 void  NV_API_CALL nv_acpi_methods_init(NvU32 *handlesPresent) { TRC; if (handlesPresent) *handlesPresent = 0; }
 void  NV_API_CALL nv_acpi_methods_uninit(void) { TRC; }
 
+#if NV_XNU_ACPI
 // Laptop panel backlight. RM only finds an internal panel's backlight when it can read the panel's
 // backlight tables from the firmware: the NBCI _DSM functions GETOBJBYTYPE (0x10) and GETBACKLIGHT
 // (0x14), plus the display ACPI ids from _DOD. Without them NV0073_CTRL_CMD_SPECIFIC_GET_BACKLIGHT_BRIGHTNESS
@@ -1560,6 +1706,15 @@ NV_STATUS NV_API_CALL nv_acpi_dsm_method(nv_state_t *nv, NvU8 *pAcpiDsmGuid, NvU
     }
     return st;
 }
+#else
+// No ACPI: the RM gets "not supported" for _DOD and every _DSM, exactly what it gets on a desktop PC with the
+// backlight opt-in off. An eGPU has no internal panel for these tables to describe.
+NV_STATUS NV_API_CALL nv_acpi_dod_method(nv_state_t *nv, NvU32 *pOutData, NvU32 *pSize) { TRC; (void)nv; (void)pOutData; (void)pSize; return NV_ERR_NOT_SUPPORTED; }
+NV_STATUS NV_API_CALL nv_acpi_dsm_method(nv_state_t *nv, NvU8 *pAcpiDsmGuid, NvU32 acpiDsmRev, NvBool acpiNvpcfDsmFunction,
+                                         NvU32 acpiDsmSubFunction, void *pInParams, NvU16 inParamSize, NvU32 *outStatus,
+                                         void *pOutData, NvU16 *pSize)
+{ TRC; (void)nv; (void)pAcpiDsmGuid; (void)acpiDsmRev; (void)acpiNvpcfDsmFunction; (void)acpiDsmSubFunction; (void)pInParams; (void)inParamSize; (void)outStatus; (void)pOutData; (void)pSize; return NV_ERR_NOT_SUPPORTED; }
+#endif
 void  NV_API_CALL nv_get_screen_info(nv_state_t *nv, NvU64 *pa, NvU32 *w, NvU32 *h, NvU32 *depth, NvU32 *pitch, NvU64 *size)
 {
     TRC;
@@ -1690,7 +1845,6 @@ nv_state_t *NV_API_CALL nv_get_ctl_state(void)
     return &nv_xnu_ctl_state;
 }
 
-struct nv_xnu_upin { NvU32 magic; IOMemoryDescriptor *md; NvU64 page_count; };
 struct nv_xnu_ureg { nv_xnu_alloc a; nv_xnu_upin *pin; void *import_priv; };
 static const NvU32 kNvUpinMagic = 0x55504e31u;
 static volatile SInt64 nv_upin_live = 0, nv_upin_pages = 0, nv_upin_total = 0;
@@ -1715,6 +1869,7 @@ NV_STATUS NV_API_CALL os_lock_user_pages(void *address, NvU64 page_count, void *
     if (!p) { md->complete(); md->release(); return NV_ERR_NO_MEMORY; }
     p->magic = kNvUpinMagic; p->md = md; p->page_count = page_count;
     *page_array = p;
+    nv_pin_track(p, true);
     OSIncrementAtomic64(&nv_upin_live); OSAddAtomic64((SInt64)page_count, &nv_upin_pages);
     const SInt64 k = OSIncrementAtomic64(&nv_upin_total);
     if (k < 4 || ((k + 1) & 0x3FF) == 0)
@@ -1770,6 +1925,7 @@ NV_STATUS NV_API_CALL os_unlock_user_pages(NvU64 page_count, void *page_array, N
         return NV_ERR_INVALID_ARGUMENT;
     }
     p->magic = 0;
+    nv_pin_track(p, false);
     p->md->complete(); p->md->release();
     OSDecrementAtomic64(&nv_upin_live); OSAddAtomic64(-(SInt64)p->page_count, &nv_upin_pages);
     kern_os_free(p);

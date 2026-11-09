@@ -3106,3 +3106,40 @@ declare float @air.convert.f.f32.f.f8e5m2(i8)
         "the refusal must not be the downstream shape complaint, got {error}"
     );
 }
+
+#[test]
+fn native_device_atomics_accept_the_macos27_sdk_extra_operand() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr addrspace(1) %out, <3 x i32> %tid) {
+entry:
+  %old = tail call i32 @air.atomic.global.load.i32(ptr addrspace(1) %out, i32 0, i32 2, i32 0, i1 false)
+  %sum = tail call i32 @air.atomic.global.add.s.i32(ptr addrspace(1) %out, i32 %old, i32 0, i32 2, i32 0, i1 false)
+  tail call void @air.atomic.global.store.i32(ptr addrspace(1) %out, i32 %sum, i32 0, i32 2, i32 0, i1 false)
+  ret void
+}
+
+declare i32 @air.atomic.global.load.i32(ptr addrspace(1), i32, i32, i32, i1)
+declare i32 @air.atomic.global.add.s.i32(ptr addrspace(1), i32, i32, i32, i32, i1)
+declare void @air.atomic.global.store.i32(ptr addrspace(1), i32, i32, i32, i32, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"int", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"tid"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_device_atomic_sdk27_operand_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let (san, _) = crate::tools::sanitize_ll_text_with_datalayout(ll);
+    let spv = crate::translate_sanitized_native(&san, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpAtomicLoad"), "{asm}");
+    assert!(asm.contains("OpAtomicIAdd"), "{asm}");
+    assert!(asm.contains("OpAtomicStore"), "{asm}");
+}

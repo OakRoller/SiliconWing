@@ -500,6 +500,21 @@ fn classify_sample_level(ctx: &Ctx, arrayed: bool, args: &[Word]) -> Option<Samp
     Some(SampleLevel::Explicit(slot))
 }
 
+pub(in crate::passes) fn find_sample_min_lod_clamp(ctx: &Ctx, arrayed: bool, args: &[Word]) -> Option<Word> {
+    let start = if arrayed { 4 } else { 3 };
+    let rest = args.get(start..)?;
+    let (offset, _) = rest
+        .iter()
+        .enumerate()
+        .find(|(_, arg)| scalar_float_width(ctx, **arg).is_some())?;
+    sample_level_flag(ctx, args, start + offset)?;
+    let &clamp = args.get(start + offset + 1)?;
+    if scalar_float_width(ctx, clamp) != Some(32) || float_operand_is_constant_zero(ctx, clamp) {
+        return None;
+    }
+    Some(clamp)
+}
+
 pub(in crate::passes) fn find_sample_level(
     ctx: &mut Ctx,
     arrayed: bool,

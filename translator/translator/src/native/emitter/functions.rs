@@ -243,7 +243,80 @@ fn sampler_operand_values(function: &LlFunction) -> HashSet<String> {
             }
         }
     }
+    let phis = function
+        .carrier_insts()
+        .filter_map(|instruction| {
+            let (ty, incoming) = instruction.phi_incoming().as_ref()?;
+            let result = instruction.result.clone()?;
+            matches!(ty, LlType::Ptr(2)).then_some((result, incoming))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut work = out.iter().cloned().collect::<Vec<_>>();
+    while let Some(name) = work.pop() {
+        let Some(incoming) = phis.get(&name) else {
+            continue;
+        };
+        for (value, _) in incoming.iter() {
+            if let LlValue::Local(source) = value {
+                if out.insert(source.clone()) {
+                    work.push(source.clone());
+                }
+            }
+        }
+    }
     out
+}
+
+pub(in crate::native::emitter) fn names_contain(set: &HashSet<String>, name: &str) -> bool {
+    if set.contains(name) {
+        return true;
+    }
+    let mut current = name.to_string();
+    while let Some(source) = crate::native::cfg::clone_crossarm::clone_source_name(&current) {
+        if set.contains(&source) {
+            return true;
+        }
+        current = source;
+    }
+    false
+}
+
+pub(in crate::native::emitter) fn sampler_slot_name(name: &str) -> String {
+    format!("{name}#smpslot")
+}
+
+fn sampler_slot_source_values(function: &LlFunction, samplers: &HashSet<String>) -> HashSet<String> {
+    let mut loads = HashSet::default();
+    let mut phis = HashMap::default();
+    for instruction in function.carrier_insts() {
+        let Some(result) = instruction.result.as_ref() else {
+            continue;
+        };
+        if !samplers.contains(result) {
+            continue;
+        }
+        if instruction.load().is_some() {
+            loads.insert(result.clone());
+        } else if let Some((LlType::Ptr(2), incoming)) = instruction.phi_incoming().as_ref() {
+            phis.insert(result.clone(), incoming.clone());
+        }
+    }
+    let mut ok = phis.keys().cloned().collect::<HashSet<String>>();
+    loop {
+        let before = ok.len();
+        let current = ok.clone();
+        ok.retain(|name| {
+            phis[name].iter().all(|(value, _)| match value {
+                LlValue::Local(source) => loads.contains(source) || current.contains(source),
+                _ => false,
+            })
+        });
+        if ok.len() == before {
+            break;
+        }
+    }
+    ok.extend(loads);
+    ok
 }
 
 pub(in crate::native) fn opaque_resource_pointer_values_by_function(
@@ -423,34 +496,7 @@ impl Emitter {
             .cloned()
             .unwrap_or_default();
         self.opaque_sampler_pointers = sampler_operand_values(f);
-        self.pointer_payload_words.clear();
-        self.pointer_payload_values.clear();
-        self.pointer_phi_values.clear();
-        self.pointer_phi_incoming_values.clear();
-        self.tir_phi_incomings.clear();
-        self.phi_edge_instructions.clear();
-        self.phi_result_instructions.clear();
-        self.direct_param_values.clear();
-        self.direct_param_indices.clear();
-        self.param_values.clear();
-        self.current_parameter_types.clear();
-        self.inline_parameter_substitutions.clear();
-        self.raw_offsets.clear();
-        self.symbolic_buffer_addresses.clear();
-        self.int_alignments.clear();
-        self.unmodeled_pointers.clear();
-        for global in &self.ir.globals.clone() {
-            let pointee = self.global_declared_pointee(global)?;
-            self.pointer_pointees.insert(global.name.clone(), pointee);
-            self.pointer_storage.insert(
-                global.name.clone(),
-                if global.addrspace == 3 {
-                    StorageClass::Workgroup
-                } else {
-                    StorageClass::Private
-                },
-            );
-        }
+        self.sampler_slot_sources = sampler_slot_source_values(f, &self.opaque_sampler_pointers);
         let source_labels = f
             .blocks
             .iter()
@@ -1437,7 +1483,7 @@ impl Emitter {
                         let LlValue::Local(integer) = &source.value else {
                             return None;
                         };
-                        (self.opaque_resource_pointers.contains(pointer)
+                        (names_contain(&self.opaque_resource_pointers, pointer)
                             && use_counts.get(integer) == Some(&1))
                         .then(|| (integer.clone(), pointer.clone()))
                     }),

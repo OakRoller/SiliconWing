@@ -1,4 +1,5 @@
 use metal2vulkan::passes::Stage;
+mod store_note;
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -202,6 +203,40 @@ fn dump_failed(ll: &str, st: Stage, e: &str) {
         eprintln!("nvmtl_translate: NVMTL_DUMP_FAILED_DIR write failed: {w}");
     }
 }
+
+/// shmirror (notes item 66): instrument a finished SPIR-V module so every PhysicalStorageBuffer store / atomic / copy
+/// marks the 16-byte chunks it wrote in the twinned range's dirty bitmap (store_note.rs). The output is freed with
+/// nvmtl_translate_free. Returns 0 (sites = instrumented call sites; 0 and the same bytes when nothing stores) or -1.
+#[no_mangle]
+pub extern "C" fn nvmtl_spv_instrument_stores(
+    spv: *const u8, spv_len: usize, out: *mut *mut u8, out_len: *mut usize, sites: *mut u32,
+    err: *mut c_char, err_len: usize,
+) -> i32 {
+    let set_err = |msg: &str| unsafe {
+        if !err.is_null() && err_len > 0 {
+            let b = msg.as_bytes(); let n = b.len().min(err_len - 1);
+            std::ptr::copy_nonoverlapping(b.as_ptr(), err as *mut u8, n); *err.add(n) = 0;
+        }
+    };
+    if spv.is_null() || out.is_null() || out_len.is_null() || spv_len % 4 != 0 { set_err("bad arguments"); return -1; }
+    let input = unsafe { std::slice::from_raw_parts(spv, spv_len) };
+    match store_note::instrument(input) {
+        Ok((bytes, rep)) => {
+            if !sites.is_null() { unsafe { *sites = rep.sites; } }
+            let mut b = bytes.into_boxed_slice();
+            unsafe { *out = b.as_mut_ptr(); *out_len = b.len(); }
+            std::mem::forget(b);
+            0
+        }
+        Err(e) => { set_err(&e); -1 }
+    }
+}
+#[no_mangle]
+pub extern "C" fn nvmtl_spv_store_note_spec_id() -> u32 { store_note::SPEC_ID }
+/// shmirror: address lowering moves every buffer the module stores to onto a physical address (none keeps its
+/// descriptor), so every store can be noted. Process-wide; the plugin sets it once before any module is lowered.
+#[no_mangle]
+pub extern "C" fn nvmtl_shm_lower_stored_roots(on: u32) { buffer_addresses::LOWER_STORED.store(on != 0, std::sync::atomic::Ordering::Relaxed); }
 
 #[no_mangle]
 pub extern "C" fn nvmtl_translate_free(p: *mut u8, len: usize) {

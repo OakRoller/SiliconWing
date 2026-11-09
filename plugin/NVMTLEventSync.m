@@ -16,6 +16,7 @@
     unsigned encoders;
     NSArray *signals;
     nvmtl_inflight *inflight;
+    BOOL gpuDone;   // claimed by the worker and finished on the GPU; the worker is still publishing it (surface-out, events)
     int aheadFailed;
     BOOL waitFolded;
     BOOL aheadEmpty;
@@ -26,6 +27,16 @@
 @end
 static _Atomic unsigned gsub_inflight;
 static _Atomic unsigned long long gsub_ahead, gsub_peak;
+static _Atomic unsigned long long gsub_syncahead, gsub_tailpass;
+static BOOL nvmtl_commit_ahead_on(void);
+static void nvmtl_ahead_kick(void);
+static BOOL nvmtl_sync_ahead_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_SYNC_AHEAD"); on = !(e && e[0] == '0');
+        nvlog("commit: SYNC-AHEAD %s - a part the worker submits itself %s (NVMTL_SYNC_AHEAD=%s)", on ? "ON" : "off",
+              on ? "is marked in flight before its wait, so later parts are submitted behind it" : "holds every later part until its fence signals", e ? e : "unset"); }
+    return on;
+}
 static NSMutableArray *nvmtl_quarantined_parts;
 static int nvmtl_gsub_finish(NVMTLSubmissionPart *part) {
     nvmtl_inflight *const f = part->inflight;
@@ -313,6 +324,7 @@ static void nvmtl_busy_mark_done(NVMTLCommandBuffer *cb) {
     }
 }
 
+static int nvmtl_cb_has_wait(NSArray *parts);
 @implementation NVMTLSubmissionPart
 - (void)dealloc {
     if (inflight) {
@@ -360,7 +372,8 @@ static int nvmtl_skip_empty_on(void) {
     if (!_parts) _parts = [NSMutableArray new];
     nvmtl_g79_flush(self);
     NVMTLSubmissionPart *part = [NVMTLSubmissionPart new];
-    part->commands = _c;
+    part->commands = _c; part->commands.tl_seal = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    _c.lastk_n = 0;
     memset(&_c, 0, sizeof(_c));
     part->resources = [(NVMTLResSet *)_resources nvmtlTakeAll]; part->surfaces = [_surfDirty copy];
     // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
@@ -400,6 +413,34 @@ static int nvmtl_skip_empty_on(void) {
         _cbError = [NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorOutOfMemory
             userInfo:@{NSLocalizedDescriptionKey:@"Could not allocate recording after event boundary"}];
     }
+}
+// Parallel render encoders (NVMTL_PAR_DIRECT, default on): every sub-encoder recorded on its own thread into a shadow
+// command buffer of the same queue. Here, in sub-encoder order, their recordings become submission parts of this
+// command buffer after what it has recorded so far; recording then goes on in a fresh part. Each recording begins with
+// a full barrier (nvmtl_vk_cmd_begin), so the parts run in order. Completion handlers, late-write records and encoding
+// errors the sub-encoders left on their shadows move here; the shadows are never committed.
+- (void)nvmtlSpliceShadows:(NSArray *)shadows {
+    if (_committed) return;
+    [self nvmtlSealPartWithSignal:nil value:0 restart:NO];
+    NVMTLSubmissionPart *mine = _parts.lastObject;
+    for (NVMTLCommandBuffer *sh in shadows) {
+        if (sh->_c.cb) [sh nvmtlSealPartWithSignal:nil value:0 restart:NO];
+        for (id o in sh->_parts) {
+            if (![o isKindOfClass:[NVMTLSubmissionPart class]]) continue;
+            NVMTLSubmissionPart *p = o;
+            [_parts addObject:p];
+            for (id r in (NVMTLResSet *)p->resources) [(NVMTLResSet *)_resources addObject:r];
+        }
+        [sh->_parts removeAllObjects];
+        [sh->_completionCondition lock]; NSArray *hs = sh->_handlers; sh->_handlers = nil; sh->_nHandlers = 0; [sh->_completionCondition unlock];
+        for (id h in hs) [self addCompletedHandler:h];
+        if (sh->_lw.length) { if (!_lw) _lw = [NSMutableData new]; [_lw appendData:sh->_lw]; sh->_lw = nil; }
+        if (sh->_cbError && !_cbError) _cbError = sh->_cbError;
+    }
+    if ([mine isKindOfClass:[NVMTLSubmissionPart class]]) for (id r in (NVMTLResSet *)mine->resources) [(NVMTLResSet *)_resources addObject:r];
+    if (nvmtl_vk_cmd_begin(&_queue->_q, &_c) && !_cbError)
+        _cbError = [NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorOutOfMemory
+            userInfo:@{NSLocalizedDescriptionKey:@"Could not allocate recording after a parallel render encoder"}];
 }
 - (void)nvmtlRecordWait:(id)event value:(uint64_t)value {
     if (!event || _committed) return;
@@ -505,6 +546,7 @@ static int nvmtl_skip_empty_on(void) {
         if (inl) { for (dispatch_block_t action in _presentations) action(); }
         else { NSArray *actions = [_presentations copy]; dispatch_async(presentQ, ^{ for (dispatch_block_t action in actions) action(); }); }
     }
+    nvmtl_frames_done((unsigned)_presentations.count);
     [_presentations removeAllObjects]; _present = nil;
     double deviceStart = 0, deviceEnd = 0;
     if (!error && _gpuTimingSeen && !_gpuTimingInvalid)
@@ -517,11 +559,13 @@ static int nvmtl_skip_empty_on(void) {
     _cbError = error; _cbstatus = error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
     _executionDone = YES;
     [_completionCondition unlock];
+    nvmtl_vk_cb_reap(_commitSeq);   // releases wait until every buffer committed before them has completed
     @synchronized ([NVMTLCommandBuffer class]) { [_parts removeAllObjects]; }
     // A finished command buffer lets go of everything only its GPU work needed: the setBytes ring and the scratch
     // buffers it filled, and any resources still listed on it. Apple's command buffers do the same. An app's
     // autorelease pool can keep thousands of finished command buffers alive during a long loop (Geekbench 7 does),
     // and holding these until the command buffer itself died filled VRAM until allocations were refused.
+    nvmtl_lw_done(self);
     [_scratch removeAllObjects]; _e78Ring = nil; _e78RingOff = 0; memset(_g79BRing, 0, sizeof _g79BRing);
     [(NVMTLResSet *)_resources removeAllObjects]; [_stTwins removeAllObjects];
     // Applications may retain completed command buffers. Pending overwrite
@@ -539,7 +583,7 @@ static int nvmtl_skip_empty_on(void) {
 }
 static unsigned nvmtl_gsub_cap(void) {
     static int cap = -1;
-    if (cap < 0) { const char *e = getenv("NVMTL_GSUB_INFLIGHT"); int v = e ? atoi(e) : 16;
+    if (cap < 0) { const char *e = getenv("NVMTL_GSUB_INFLIGHT"); int v = e ? atoi(e) : 32;   // WAS 16: the worker retires parts ~7 ms after the GPU, so 16 held back parts the GPU could run (run 463: 4.7 ms a frame of scheduler idle, run 464 at 32: 0.3)
         cap = v < 1 ? 1 : v > 32 ? 32 : v;
         nvlog("commit: G-SUB submit-ahead %s, at most %d parts in flight (NVMTL_GSUB_INFLIGHT=%s)",
               nvmtl_async_commit_on() && nvmtl_g79_on(NVMTL_G79_SUB) ? "ON" : "off", cap, e ? e : "unset"); }
@@ -575,8 +619,8 @@ static void nvmtl_gsub_census(void) {
     const unsigned long long k = atomic_load(&gsub_ahead);
     if (k & (k - 1)) return;
     uint64_t s[9]; nvmtl_vk_gsub_nvk_stats(s, 9);
-    nvlog("commit: G-SUB %llu parts submitted ahead, peak %llu in flight | NVK %s submits %llu acquires %llu cpuwaits %llu slotwaits %llu fifowaits %llu deferred %llu reaped %llu waits %llu",
-          k, (unsigned long long)atomic_load(&gsub_peak), s[0] == ~0ull ? "G-SUB ABSENT" : s[0] ? "async" : "SYNC (NVRM_ASYNC=0)",
+    nvlog("commit: G-SUB %llu parts submitted ahead (%llu by the worker before its wait, %llu passed an empty tail), peak %llu in flight | NVK %s submits %llu acquires %llu cpuwaits %llu slotwaits %llu fifowaits %llu deferred %llu reaped %llu waits %llu",
+          k, (unsigned long long)atomic_load(&gsub_syncahead), (unsigned long long)atomic_load(&gsub_tailpass), (unsigned long long)atomic_load(&gsub_peak), s[0] == ~0ull ? "G-SUB ABSENT" : s[0] ? "async" : "SYNC (NVRM_ASYNC=0)",
           (unsigned long long)s[1], (unsigned long long)s[2], (unsigned long long)s[3], (unsigned long long)s[4],
           (unsigned long long)s[5], (unsigned long long)s[6], (unsigned long long)s[7], (unsigned long long)s[8]);
 }
@@ -590,7 +634,7 @@ static NSArray<NVMTLBuffer *> *nvmtl_submission_copies(NSSet *resources, BOOL wr
         else if ([resource isKindOfClass:[NVMTLTexture class]]) {
             NVMTLTexture *texture = resource;
             if (writtenOnly && texture->_usage != MTLTextureUsageUnknown &&
-                !(texture->_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget))) continue;
+                !(NVMTL_USAGE_WRITES(texture->_usage) || (texture->_usage & MTLTextureUsageRenderTarget))) continue;
             buffer = texture->_backBuf ?: (texture->_parent ? texture->_parent->_backBuf : nil);
         }
         if (!buffer || (!buffer->_hostPtr && !buffer->_shadow.map)) continue;
@@ -610,23 +654,84 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
     }
     part->copyInputsPrepared = YES;
 }
+// Why the submit-ahead pass stopped (each "return NO" in nvmtlSubmitAhead), counted and printed every 2^k declines:
+// the benchmark ran ~42 submissions a frame, each submitted and waited by nvmtlAdvancePart, the GPU idle in between
+// (2026-11-05). The census names the condition that keeps parts from being pipelined.
+static const char *nvmtl_ahead_why[] = {
+    "if (_executionDone || _partsRetiring || _cbError || !_committed || _commitMarking) return ",
+    "if (atomic_load(&gsub_inflight) >= nvmtl_gsub_cap()) return NO;",
+    "if (![part isKindOfClass:[NVMTLSubmissionPart class]]) return NO;",
+    "if (part->claimed) return NO;",
+    "if (!nvmtl_evfold_on() || nvmtl_evfold_promised(part->waitEvent) < part->value) return NO;",
+    "if (!part->commands.cb) return NO;",
+    "if (!nvmtl_evfold_on() || _nextSubmit + 1 >= _parts.count) return NO;",
+    "if (hold && part->hasHostCopies) return NO;",
+    "if (!f) return NO;",
+    "return NO;"
+};
+static _Atomic unsigned long long nvmtl_ahead_no_n[10], nvmtl_ahead_no_total;
+static BOOL nvmtl_ahead_past_done(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_AHEAD_PAST_DONE"); on = !(e && e[0] == '0');
+        nvlog("commit: submit-ahead %s a claimed part the GPU has finished (NVMTL_AHEAD_PAST_DONE=%s)", on ? "passes" : "stops at", e ? e : "unset"); }
+    return on;
+}
+static BOOL nvmtl_ahead_no(int why)
+{
+    atomic_fetch_add(&nvmtl_ahead_no_n[why], 1);
+    const unsigned long long k = atomic_fetch_add(&nvmtl_ahead_no_total, 1) + 1;
+    if (!(k & (k - 1)) && k >= 1024) {
+        char buf[2048]; size_t n = 0;
+        for (int i = 0; i < 10 && n < sizeof buf - 160; i++) { const unsigned long long c = atomic_load(&nvmtl_ahead_no_n[i]); if (c) n += snprintf(buf + n, sizeof buf - n, " [%llu] %s |", c, nvmtl_ahead_why[i]); }
+        nvlog("commit: submit-ahead declined %llu times:%s", k, buf);
+    }
+    return NO;
+}
+// the same, remembered on the part the pass stopped at (passtime rec lines: why it was not submitted ahead)
+static BOOL nvmtl_ahead_no_at(id o, int why)
+{
+    if ([o isKindOfClass:[NVMTLSubmissionPart class]]) { NVMTLSubmissionPart *p = o; p->commands.tl_why = (unsigned)why + 1; p->commands.tl_whymask |= 1u << why; }
+    return nvmtl_ahead_no(why);
+}
+#include <sys/stat.h>
+static int nvmtl_noahead_live(void)
+{
+    extern _Atomic unsigned nvmtl_flick_frame;
+    static _Atomic uint64_t next; static _Atomic int on;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (now >= atomic_load(&next)) {
+        atomic_store(&next, now + 500000000ull);
+        struct stat st; const int v = stat("/tmp/nvmtl-noahead", &st) == 0;
+        if (v != atomic_exchange(&on, v))
+            nvlog("noahead: %s at frame %u (/tmp/nvmtl-noahead %s) - %s", v ? "ON" : "OFF", atomic_load(&nvmtl_flick_frame), v ? "exists" : "gone",
+                  v ? "no part is submitted ahead, each waits for the one before it on the GPU; the CPU still runs ahead" : "submit-ahead back on");
+    }
+    return atomic_load(&on);
+}
 - (BOOL)nvmtlSubmitAhead {
+    if (nvmtl_noahead_live()) return NO;
     // a commit still putting its kernel marks in (nvmtlSubmitWithEvents) must not reach the GPU before them
-    if (_executionDone || _partsRetiring || _cbError || !_committed || _commitMarking) return NO;
+    if (_executionDone || _partsRetiring || _cbError || !_committed || _commitMarking) return nvmtl_ahead_no_at(_nextSubmit < _parts.count ? _parts[_nextSubmit] : (_nextPart < _parts.count ? _parts[_nextPart] : nil), 0);
     if (_nextSubmit < _nextPart) _nextSubmit = _nextPart;
     while (_nextSubmit < _parts.count) {
-        if (atomic_load(&gsub_inflight) >= nvmtl_gsub_cap()) return NO;
+        if (atomic_load(&gsub_inflight) >= nvmtl_gsub_cap()) return nvmtl_ahead_no_at(_parts[_nextSubmit], 1);
         NVMTLSubmissionPart *part = _parts[_nextSubmit];
-        if (![part isKindOfClass:[NVMTLSubmissionPart class]]) return NO;
-        if (part->claimed) return NO;
+        if (![part isKindOfClass:[NVMTLSubmissionPart class]]) return nvmtl_ahead_no_at(part, 2);
+        if (part->claimed) {
+            // a claimed part the GPU has finished is passed like one in flight: the worker may spend a while publishing
+            // it (surface-out readback, events, callbacks), and stopping here left the GPU idle all that time
+            if ((part->inflight || (part->gpuDone && nvmtl_ahead_past_done())) && nvmtl_sync_ahead_on()) { _nextSubmit++; continue; }
+            return nvmtl_ahead_no_at(part, 3);
+        }
         if (part->waitEvent) {
-            if (!nvmtl_evfold_on() || nvmtl_evfold_promised(part->waitEvent) < part->value) return NO;
+            if (!nvmtl_evfold_on() || nvmtl_evfold_promised(part->waitEvent) < part->value) return nvmtl_ahead_no_at(part, 4);
             part->waitFolded = YES; _nextSubmit++; nvmtl_evfold_census(&gEvFold, "event waits ordered by the channel (no CPU hold)");
             continue;
         }
-        if (!part->commands.cb) return NO;
+        if (!part->commands.cb) return nvmtl_ahead_no_at(part, 5);
         if (!part->encoders && !part->resources.count && !part->surfaces.count && !part->scratch.count && nvmtl_skip_empty_on()) {
-            if (!nvmtl_evfold_on() || _nextSubmit + 1 >= _parts.count) return NO;
+            if (nvmtl_evfold_on() && _nextSubmit + 1 >= _parts.count && nvmtl_sync_ahead_on() && !part->waitEvent) { atomic_fetch_add(&gsub_tailpass, 1); return YES; }
+            if (!nvmtl_evfold_on() || _nextSubmit + 1 >= _parts.count) return nvmtl_ahead_no_at(part, 6);
             [self nvmtlMarkScheduled];
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
             nvmtl_vk_cmd_abandon(&part->commands);
@@ -639,19 +744,21 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
         {
             static int hold = -1;
             if (hold < 0) { const char *e = getenv("NVMTL_GSUB_HOSTPTR_LIFT"); hold = (e && *e && *e != '0') ? 0 : 1; }
-            if (hold && part->hasHostCopies) return NO;
+            if (hold && part->hasHostCopies) return nvmtl_ahead_no_at(part, 7);
         }
         nvmtl_inflight *f = nvmtl_vk_inflight_new();
-        if (!f) return NO;
+        if (!f) return nvmtl_ahead_no_at(part, 8);
         for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
         [self nvmtlMarkScheduled];
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
+        if (!_lwChecked) nvmtl_lw_check(self, nvmtl_cb_has_wait(_parts));
+        part->commands.tl_inflight = (unsigned)atomic_load(&gsub_inflight);
         const int r = nvmtl_vk_submit_begin(&part->commands, f);
         _nextSubmit++;
         if (r) {
             nvmtl_vk_inflight_free(f);
             part->aheadFailed = r;
-            return NO;
+            return nvmtl_ahead_no_at(part, 9);
         }
         part->inflight = f;
         nvmtl_evfold_promise_part(part);
@@ -683,6 +790,24 @@ static void nvmtl_gsub_ahead_pass1(void) {
         }
     }
 }
+NSString *nvmtl_cb_describe(NVMTLCommandBuffer *cb)
+{
+    NSMutableString *d = [NSMutableString stringWithFormat:@"label '%@' parts %lu", cb->_label ?: @"", (unsigned long)cb->_parts.count];
+    for (id o in cb->_parts) {
+        if (![o isKindOfClass:[NVMTLSubmissionPart class]]) continue;
+        NVMTLSubmissionPart *p = o;
+        if (p->waitEvent) [d appendFormat:@" | waits %p >= %llu", (__bridge void *)p->waitEvent, (unsigned long long)p->value];
+        if (p->signalEvent) [d appendFormat:@" | signals %p -> %llu (now %llu)", (__bridge void *)p->signalEvent, (unsigned long long)p->value,
+                             [p->signalEvent respondsToSelector:@selector(signaledValue)] ? (unsigned long long)[(id<MTLSharedEvent>)p->signalEvent signaledValue] : 0ull];
+        for (NSArray *sg in p->signals) [d appendFormat:@" | signals %p -> %@", (__bridge void *)sg[0], sg[1]];
+    }
+    return d;
+}
+static int nvmtl_cb_has_wait(NSArray *parts)
+{
+    for (id p in parts) if ([p isKindOfClass:[NVMTLSubmissionPart class]] && ((NVMTLSubmissionPart *)p)->waitEvent) return 1;
+    return 0;
+}
 - (BOOL)nvmtlAdvancePart {
     if (_executionDone) return NO;
     if (_cbError) { [self nvmtlFinishExecution:_cbError]; return YES; }
@@ -697,7 +822,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
             return YES;
         }
         uint64_t have = ((uint64_t(*)(id,SEL))objc_msgSend)(part->waitEvent,@selector(signaledValue));
-        if (have < part->value) { @synchronized ([NVMTLCommandBuffer class]) { part->claimed = NO; } return NO; }
+        if (have < part->value) { part->commands.tl_cpuwait = 1; @synchronized ([NVMTLCommandBuffer class]) { part->claimed = NO; } return NO; }
     }
     if (!ahead && part->commands.cb && !part->encoders && !part->resources.count && !part->surfaces.count && !part->scratch.count && nvmtl_skip_empty_on()) {
         [self nvmtlMarkScheduled];
@@ -715,13 +840,33 @@ static void nvmtl_gsub_ahead_pass1(void) {
         else {
             nvmtl_prepare_submission_copies(part);
             for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
-            result = nvmtl_vk_submit_wait(&part->commands);
+            if (!_lwChecked) nvmtl_lw_check(self, nvmtl_cb_has_wait(_parts));
+            nvmtl_inflight *f = nvmtl_sync_ahead_on() && nvmtl_gsub_ahead_on() ? nvmtl_vk_inflight_new() : NULL;
+            if (f) {
+                part->commands.tl_inflight = (unsigned)atomic_load(&gsub_inflight);
+                result = nvmtl_vk_submit_begin(&part->commands, f);
+                if (result) nvmtl_vk_inflight_free(f);
+                else {
+                    @synchronized ([NVMTLCommandBuffer class]) {
+                        part->inflight = f;
+                        nvmtl_evfold_promise_part(part);
+                        atomic_fetch_add(&gsub_inflight, 1);
+                    }
+                    atomic_fetch_add(&gsub_syncahead, 1);
+                    if (nvmtl_commit_ahead_on()) nvmtl_ahead_kick();
+                    result = nvmtl_gsub_finish(part);
+                }
+            } else result = nvmtl_vk_submit_wait(&part->commands);
         }
         if (result == -2) {
             if (!nvmtl_quarantined_parts) nvmtl_quarantined_parts = [NSMutableArray new];
             [nvmtl_quarantined_parts addObject:part];
         }
         if (result == 0) [self nvmtlCollectDeviceTiming:&part->commands];
+        if (result == 0 && nvmtl_ahead_past_done()) {   // let the ahead pass run past this part while it is published
+            @synchronized ([NVMTLCommandBuffer class]) { part->gpuDone = YES; }
+            if (nvmtl_commit_ahead_on() && nvmtl_gsub_ahead_on()) nvmtl_ahead_kick();
+        }
         BOOL published = result == 0;
         if (published) {
             // the GPU has finished this part: its surfaces' kernel marks are released (nvmtl_ws_part_landed) before the
@@ -774,6 +919,8 @@ static void nvmtl_gsub_ahead_pass1(void) {
     nvmtl_ws_mark_pending(self);
     @synchronized ([NVMTLCommandBuffer class]) {
         _commitMarking = NO;
+        { const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);   // timeline: when the app committed each part's buffer
+          for (id o in _parts) if ([o isKindOfClass:[NVMTLSubmissionPart class]] && !((NVMTLSubmissionPart *)o)->commands.tl_commit) ((NVMTLSubmissionPart *)o)->commands.tl_commit = now; }
         nvmtl_surface_register_writes(self);
         nvmtl_busy_mark_commit(self);
         if (!nvmtl_pending_buffers) nvmtl_pending_buffers = [NSMutableArray new];
@@ -832,8 +979,50 @@ static void nvmtl_ahead_kick(void) {
         } while (1);
     });
 }
+// /tmp/nvmtl-pending-request (consumed when seen, polled every 2 s once anything was committed): log every pending
+// command buffer and the part it is stuck on - which event it waits for, at what value, and where that event stands.
+// Written for Cyberpunk's main menu (2026-11-04): the game went idle (2 % CPU, every thread in a condvar/usleep) after
+// one frame, no thread inside Metal or the plugin, so whatever it waits for is a completion or event we never delivered.
+static void nvmtl_pending_dump(void) {
+    NSArray *batch; @synchronized ([NVMTLCommandBuffer class]) { batch = [nvmtl_pending_buffers copy]; }
+    nvlog("pending-dump: %lu pending command buffer(s), pumping %d, generation %llu, empty parts skipped %llu", (unsigned long)batch.count, (int)nvmtl_pumping,
+          (unsigned long long)nvmtl_pump_generation, (unsigned long long)atomic_load(&gSkipEmpty));
+    unsigned i = 0;
+    for (NVMTLCommandBuffer *cb in batch) {
+        NSUInteger np = cb->_parts.count, nx = cb->_nextPart;
+        NVMTLSubmissionPart *part = nx < np ? cb->_parts[nx] : nil;
+        if (part && ![part isKindOfClass:[NVMTLSubmissionPart class]]) part = nil;
+        NSString *w = @"-", *sg = @"-";
+        if (part && part->waitEvent) {
+            uint64_t have = [part->waitEvent respondsToSelector:@selector(signaledValue)] ? ((uint64_t(*)(id,SEL))objc_msgSend)(part->waitEvent,@selector(signaledValue)) : ~0ull;
+            w = [NSString stringWithFormat:@"WAIT %s %p '%@' for %llu (now %llu)%s", class_getName([part->waitEvent class]), (__bridge void *)part->waitEvent,
+                 [part->waitEvent respondsToSelector:@selector(label)] ? [part->waitEvent label] : @"", (unsigned long long)part->value, (unsigned long long)have,
+                 part->waitFolded ? " folded" : ""];
+        }
+        if (part && part->signalEvent) sg = [NSString stringWithFormat:@"SIGNAL %p -> %llu", (__bridge void *)part->signalEvent, (unsigned long long)part->value];
+        BOOL first; @synchronized ([NVMTLCommandBuffer class]) {
+            NSMutableArray *r = cb->_queue->_reservations; first = r.count && ((NVMTLQueueReservation *)r.firstObject)->buffer == cb; }
+        nvlog("pending-dump #%u cb %p '%s' queue %p status %d committed %d done %d part %lu/%lu: %s | enc %u res %lu surf %lu inflight %d claimed %d aheadFailed %d signals %lu | %s | %s | %s",
+              i++, (__bridge void *)cb, cb->_label.UTF8String ?: "", (__bridge void *)cb->_queue, (int)cb->_cbstatus, (int)cb->_committed, (int)cb->_executionDone,
+              (unsigned long)nx, (unsigned long)np, first ? "FIRST in queue" : "behind another buffer", part ? part->encoders : 0,
+              (unsigned long)(part ? part->resources.count : 0), (unsigned long)(part ? part->surfaces.count : 0), part ? (part->inflight != NULL) : 0,
+              part ? part->claimed : 0, part ? part->aheadFailed : 0, (unsigned long)(part ? part->signals.count : 0), w.UTF8String, sg.UTF8String,
+              part && part->commands.cb ? "has commands" : "no commands");
+    }
+}
+static void nvmtl_pending_watch(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 2 * NSEC_PER_SEC, NSEC_PER_SEC / 2);
+        dispatch_source_set_event_handler(t, ^{ if (access("/tmp/nvmtl-pending-request", F_OK) == 0) { unlink("/tmp/nvmtl-pending-request"); nvmtl_pending_dump(); } });
+        dispatch_resume(t);
+        static dispatch_source_t keep; keep = t;
+    });
+}
 static void nvmtl_pump_buffers(void) {
     static dispatch_once_t once; static dispatch_queue_t worker;
+    nvmtl_pending_watch();
     const BOOL async = nvmtl_async_commit_on();
     if (async) dispatch_once(&once, ^{ worker = dispatch_queue_create("nvmtl.execution", DISPATCH_QUEUE_SERIAL); });
     if (!async) { nvmtl_vk_clock_refresh(); nvmtl_pump_buffers_sync(); return; }

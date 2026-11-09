@@ -1,2 +1,10 @@
 __pycache__/
 *.pyc
+
+# arm64 port build products (build/arm64/*.sh)
+out/
+
+# Rust build output of the translator (several GB)
+translator/*/target/
+# the developer's unattended-testing setup (sudoers rules, launchd jobs with local paths) - not for publishing
+tools/arm64-probes/unattended/

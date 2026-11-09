@@ -7,15 +7,36 @@ if [ "${1:-}" = --payload ]; then
   [ "$#" = 2 ] && [ -d "$2" ] || { echo "STOP: --payload requires an existing package directory" >&2; exit 2; }
   HERE=$(cd "$2" && pwd) || exit 2
 elif [ "$#" != 0 ]; then echo "STOP: expected --payload directory or no arguments" >&2; exit 2; fi
-KEXTS="NVRM NVAccel NVRMFB NVRMAGDC"
+# One script for both Macs: ARCH picks the kext set, the kernel-collection arguments and the steps that differ, and every
+# x86_64 line is the one that shipped. Apple Silicon (docs/ARM64-PORT-NOTES.md): the card renders and Apple's own display
+# shows the result (the accelerator's headless mode), so NVRMFB, NVRMAGDC and the primary-GPU selector, which exist to
+# drive a display on the card, are never installed there, and NVAccelArm (kexts/NVAccelArm) stands in for NVAccel.
+ARCH=$(uname -m)
+case $ARCH in
+  arm64) KEXTS="NVRM NVAccelArm"; KARCH=arm64e; KEXTS_WORD=both;;
+  *) KEXTS="NVRM NVAccel NVRMFB NVRMAGDC"; KARCH=x86_64; KEXTS_WORD="all four";;
+esac
 EXT=/Library/Extensions; GB=/Library/GPUBundles; FW=/Library/NullMoth/nvfw; FWOLD=/Users/Shared/nvfw
 KC=/Library/KernelCollections/AuxiliaryKernelExtensions.kc
 K=/System/Library/Kernels/kernel
+if [ "$ARCH" = arm64 ]; then
+  # /System/Library/Kernels/kernel is the x86_64 image even on an Apple Silicon Mac (measured, macOS 27); the kernel that
+  # runs is the per-chip one kern.version names (RELEASE_ARM64_T6000 -> kernel.release.t6000). Nothing else about the KDK
+  # changes: there is none, and --allow-missing-kdk stays.
+  chip=$(sysctl -n kern.version 2>/dev/null | sed -nE 's/.*RELEASE_ARM64_([A-Za-z0-9]+).*/\1/p' | tr '[:upper:]' '[:lower:]')
+  K=""; [ -z "$chip" ] || K="/System/Library/Kernels/kernel.release.$chip"
+fi
 # macOS 13+ kmutil refuses to build any kernel collection without a Kernel Debug Kit matching the build unless it is told
 # --allow-missing-kdk. The auxiliary collection only links against the boot and system collections already on disk.
 KARG=(--allow-missing-kdk); [ -f "$K" ] && KARG+=(--kernel "$K")
 KB=/System/Library/KernelCollections/BootKernelExtensions.kc
 KS=/System/Library/KernelCollections/SystemKernelExtensions.kc
+if [ "$ARCH" = arm64 ]; then
+  # Apple Silicon has no /System/Library/KernelCollections: the kernel, the boot kexts and the system kexts are one file,
+  # the Preboot kernelcache, and kmutil inspect names it. The auxiliary build links against that file as both collections.
+  KB=$(kmutil inspect -a arm64e 2>/dev/null | sed -nE 's/^boot kernel collection at (.*) \([0-9A-Fa-f-]+\):$/\1/p' | head -1)
+  KS=$KB
+fi
 BK=""; LOCKDIR=/Library/NullMoth/install.lock; LOCK_HELD=0; LOCK_RELEASE_OK=1; LOCK_ID=""
 INSTALLING=0; NEWKC=""; STAGE=""
 release_install_lock() {
@@ -118,6 +139,75 @@ backup_copy() {
     die "back up $component"
   fi
 }
+# Apple Silicon only. Third-party kexts load there only under a boot security policy the owner set in recoveryOS, and
+# the first load of each kext also needs an approval in System Settings and a restart. The install reads the policy up
+# front (bputil -d prints the LocalPolicy, root only; csrutil status says whether kext signatures are still checked)
+# and stops with the way out, instead of ending in kernelmanagerd's one-line refusal. Nothing here changes the policy:
+# it cannot be changed from macOS. These kexts carry no Developer ID signature, so the Reduced Security box ("Allow user
+# management of kernel extensions from identified developers") alone does not admit them; csrutil disable in recoveryOS
+# sets Permissive Security and switches that signature check off in one step.
+ARM64_POLICY_HELP='   Restart holding the power button until "Options" appears, open Utilities > Terminal and run
+      csrutil disable
+   (Permissive Security: unsigned kernel extensions and boot-args allowed), then restart into macOS and install again.
+   Startup Security Utility > Reduced Security with "Allow user management of kernel extensions" admits only kexts signed
+   with a Developer ID, which these are not.'
+ARM64_APPROVE=0
+arm64_policy() {
+  local pol mode kexts sip signed=1 k vg
+  # A Mac with more than one macOS installed makes bputil -d ask which one to show (this Mac has two), so the running
+  # volume group is named and its input is closed; a bputil that still asks gets EOF and the policy stays unread.
+  vg=$(diskutil info / 2>/dev/null | sed -n 's/^ *APFS Volume Group: *//p' | head -1)
+  pol=$(bputil -d ${vg:+-v "$vg"} </dev/null 2>/dev/null) || pol=""
+  mode=$(printf '%s\n' "$pol" | grep -i -m1 'security mode' | sed 's/^[^:]*: *//')
+  kexts=$(printf '%s\n' "$pol" | grep -i -m1 'kext' | sed 's/^[^:]*: *//')
+  sip=$(csrutil status 2>/dev/null)
+  for k in $KEXTS; do codesign -dvv "$(kpath "$k")" 2>&1 | grep -q '^Authority=' || signed=0; done
+  case "$mode" in
+    *[Pp]ermissive*) ok "boot policy: $mode";;
+    *[Ff]ull*) die "boot policy is Full Security: macOS loads no third-party kernel extensions (no changes made)
+$ARM64_POLICY_HELP";;
+    *[Rr]educed*)
+      case "$kexts" in
+        *[Ee]nabled*|*[Aa]llowed*) ok "boot policy: $mode, user kernel extensions allowed";;
+        *) die "boot policy is Reduced Security without user kernel extensions (no changes made)
+$ARM64_POLICY_HELP";;
+      esac;;
+    "") echo "   note: the boot policy could not be read (bputil -d); kernelmanagerd decides below";;
+    *) echo "   note: boot policy \"$mode\" not recognised; kernelmanagerd decides below";;
+  esac
+  if [ "$signed" = 0 ] && { printf '%s\n' "$sip" | grep -q 'status: enabled\.' || printf '%s\n' "$sip" | grep -qi 'Kext Signing: enabled'; }; then
+    die "System Integrity Protection still checks kernel-extension signatures, and these kexts have no Developer ID (no changes made)
+$ARM64_POLICY_HELP"
+  fi
+  [ "$signed" = 1 ] || echo "   note: the kexts are unsigned or ad-hoc signed; macOS admits them only under Permissive Security"
+}
+# <kmutil log>: the policy explanation when kmutil's refusal reads like one, or nothing (on x86_64 always nothing)
+arm64_kmutil_hint() {
+  [ "${ARCH:-}" = arm64 ] || return 0
+  grep -qiE 'not approved|not allowed|not permitted|security mode|policy|permissive|reduced security|signature|untrusted|rejected' "$1" 2>/dev/null || return 0
+  printf '%s\n%s\n' "macOS refused the kernel extensions under the current boot security policy:" "$ARM64_POLICY_HELP"
+}
+# Apple Silicon: the auxiliary collection is not a file this script writes. kernelmanagerd builds it in the Preboot
+# volume and the Secure Enclave signs its hash into the LocalPolicy, so the way in is a load request for each kext:
+# kernelmanagerd stages and checks it; on a first install macOS answers "not approved" and shows the notice that sends
+# the user to System Settings > Privacy & Security, and the collection is built after the approval and a restart. A kext
+# already allowed is rebuilt into the collection now (and may start before the restart; the fallback job below treats
+# that like any other start).
+arm64_stage_kexts() {
+  local k log hint
+  for k in $KEXTS; do
+    log="$T/kmload-$k.log"
+    if kmutil load -p "$EXT/$k.kext" >"$log" 2>&1; then ok "$k accepted by kernelmanagerd"; continue; fi
+    if grep -qiE 'not approved|approv' "$log"; then
+      ARM64_APPROVE=1; echo "   $k: waiting for your approval in System Settings > Privacy & Security"; continue
+    fi
+    tail -20 "$log"
+    hint=$(arm64_kmutil_hint "$log")
+    [ -z "$hint" ] || die "kernelmanagerd refused $k (restore from $BK)
+$hint"
+    echo "   NOTE: kmutil load $k failed (log above); the restart decides whether the collection was rebuilt"
+  done
+}
 finish_install() { [ -z "$STAGE" ] || rm -rf "$STAGE"; release_install_lock; }
 trap finish_install EXIT
 trap 'die "installer interrupted (signal HUP)"' HUP
@@ -126,14 +216,23 @@ trap 'die "installer interrupted (signal TERM)"' TERM
 
 [ "$(id -u)" -eq 0 ] || die "run with sudo"
 step "1. this Mac"
-[ "$(uname -m)" = x86_64 ] || die "Intel/x86_64 only"
+case $ARCH in x86_64|arm64) ;; *) die "Intel/x86_64 or Apple Silicon/arm64 only (this is $ARCH)";; esac
 v=$(sw_vers -productVersion); MAJ=${v%%.*}
 BUILD=$(sw_vers -buildVersion)
 printf '%s\n' "$BUILD" | grep -Eq '^[0-9]+[A-Za-z][A-Za-z0-9]+$' || die "cannot identify the current macOS build"
-case $MAJ in 15|26) ;; *) die "This driver is built for macOS 15 and 26 (this is $v); no changes made";; esac
-# NVAccel is the one kext built per macOS: Tahoe made the IOAcceleratorFamily2 methods it inherits private (see
-# kexts/NVRM/accel/gen_tahoe_fwd.py). The other three kexts are the same binaries on 15 and 26.
-VAR="$HERE/Library/NullMoth/kexts/$MAJ"; [ -d "$VAR/NVAccel.kext" ] || die "this package has no NVAccel for macOS $MAJ"
+if [ "$ARCH" = x86_64 ]; then
+  case $MAJ in 15|26) ;; *) die "This driver is built for macOS 15 and 26 (this is $v); no changes made";; esac
+  # NVAccel is the one kext built per macOS: Tahoe made the IOAcceleratorFamily2 methods it inherits private (see
+  # kexts/NVRM/accel/gen_tahoe_fwd.py). The other three kexts are the same binaries on 15 and 26.
+  VAR="$HERE/Library/NullMoth/kexts/$MAJ"; [ -d "$VAR/NVAccel.kext" ] || die "this package has no NVAccel for macOS $MAJ"
+else
+  # The Apple Silicon kexts were linked against the macOS 27 kernel collection (every imported symbol checked, see
+  # docs/ARM64-PORT-NOTES.md); 26 is admitted because the test build in step 3 is the real check of those symbols.
+  case $MAJ in 26|27) ;; *) die "The Apple Silicon build is for macOS 26 and 27 (this is $v); no changes made";; esac
+  [ -n "$KB" ] && [ -f "$KB" ] || die "cannot find this Mac's kernel collection (kmutil inspect -a arm64e named none); no changes made"
+  VAR=""   # no per-macOS accelerator: NVAccelArm uses only IOGraphicsFamily's public IOAccelerator
+  for k in $KEXTS; do [ -d "$HERE/Library/Extensions/$k.kext" ] || die "this package has no $k.kext built for Apple Silicon (arm64e)"; done
+fi
 kpath() {
   case "$1" in
     NVAccel) echo "$VAR/NVAccel.kext";;
@@ -141,7 +240,10 @@ kpath() {
     *) echo "$HERE/Library/Extensions/$1.kext";;
   esac
 }
-ioreg -r -c IOPCIDevice -d 1 | grep -q '"vendor-id" = <de100000>' || die "no NVIDIA GPU found on PCI"
+# On Apple Silicon the card is a hot-plugged eGPU, and a driver that panics on plug cannot be replaced while it is
+# plugged in: NOGPU=1 installs without the card present (the kexts match it the next time it is plugged in).
+if [ "$ARCH" = arm64 ] && [ "${NOGPU:-0}" = 1 ]; then echo "   note: NOGPU=1, not checking for the card (plug the eGPU in after the restart)"
+else ioreg -r -c IOPCIDevice -d 1 | grep -q '"vendor-id" = <de100000>' || die "no NVIDIA GPU found on PCI${ARCH:+ (arm64: NOGPU=1 installs with the eGPU unplugged)}"; fi
 # The driver runs the cards NVIDIA's GSP firmware supports (Turing and later). The same list the Windows builder uses
 # (open-gpu-kernel-modules 615.78.08, p1401/nvidia_gsp_ids.json). Installing it for an older card (GTX 10 and before)
 # would switch the firmware screen off and leave nothing to draw: those PCs run macOS in basic display instead.
@@ -164,8 +266,12 @@ CARD=""; for i in $NV_IDS; do case " $(echo $SUPPORTED_IDS) " in *" $i "*) CARD=
 # Every device id from 1E00 up is Turing or newer (TU102 is 1E02; Volta and older sit below it), which RM drives through GSP.
 # The list above names the GeForce/RTX ids measured so far; a Quadro T1200 laptop (1FBC) was refused as "older".
 [ -n "$CARD" ] || for i in $NV_IDS; do case $i in *[!0-9A-F]*|"") ;; *) [ $((16#$i)) -ge $((16#1E00)) ] && CARD=$i;; esac; done
+if [ "$ARCH" = arm64 ] && [ "${NOGPU:-0}" = 1 ] && [ -z "$NV_IDS" ]; then CARD=nogpu; ok "macOS $v, $ARCH, installing without the card (NOGPU=1)"
+else
 [ -n "$CARD" ] || die "this NVIDIA card (device $(echo $NV_IDS)) is older than the driver supports (RTX 20 / Turing and newer); macOS keeps running on it in basic display, with no changes made"
-ok "macOS $v, x86_64, NVIDIA GPU present"
+ok "macOS $v, $ARCH, NVIDIA GPU present"
+fi
+[ "$ARCH" != arm64 ] || arm64_policy
 
 step "2. package integrity"
 # The extracted package is usually writable by the logged-in user, so a process running as that user could swap a kext
@@ -185,10 +291,17 @@ VAR="$HERE/Library/NullMoth/kexts/$MAJ"
 # --strict: without it shasum skips a malformed line and still reports success
 (cd "$HERE" && shasum -a 256 --strict -c SHA256SUMS --quiet) || die "SHA256SUMS mismatch: re-download the package"
 for target in 15 26; do
+  [ "$ARCH" = x86_64 ] || continue   # the per-macOS accelerator is an x86 kext; Apple Silicon ships one build of each kext
   [ -f "$HERE/Library/NullMoth/kexts/$target/NVAccel.kext/Contents/MacOS/NVAccel" ] && \
     [ -f "$HERE/Library/NullMoth/kexts/$target/NVAccel.kext/Contents/Info.plist" ] || die "this package lacks the complete macOS $target accelerator"
 done
-ok "every file matches SHA256SUMS and both OS accelerators are present"
+if [ "$ARCH" = x86_64 ]; then ok "every file matches SHA256SUMS and both OS accelerators are present"
+else
+  for k in $KEXTS; do
+    [ -f "$HERE/Library/Extensions/$k.kext/Contents/MacOS/$k" ] && [ -f "$HERE/Library/Extensions/$k.kext/Contents/Info.plist" ] || die "this package lacks the complete $k kext"
+  done
+  ok "every file matches SHA256SUMS and both Apple Silicon kexts are present"
+fi
 RUNTIME_PREFLIGHT="$SELF/nullmoth-runtime-check.sh"
 [ -x "$RUNTIME_PREFLIGHT" ] || die "runtime compatibility checker is missing"
 /bin/bash "$RUNTIME_PREFLIGHT" "$HERE" "$v" || die "userland runtime cannot load on this macOS version"
@@ -269,11 +382,16 @@ primary_requested() {
 # An already configured selector is an opt-in that must survive a driver update.
 # NM_PRIMARY_GPU=1 is for a first manual installation with a packaged selector.
 PRIMARY=0
-primary_requested; primary_status=$?
-case "$primary_status" in
- 0) PRIMARY=1;;
- 2) die "incomplete primary-GPU matching on installed kexts; no files changed";;
-esac
+if [ "$ARCH" = x86_64 ]; then
+  primary_requested; primary_status=$?
+  case "$primary_status" in
+   0) PRIMARY=1;;
+   2) die "incomplete primary-GPU matching on installed kexts; no files changed";;
+  esac
+else
+  # the selector makes the card the Mac's display GPU; on Apple Silicon the card drives no display at all
+  [ "${NM_PRIMARY_GPU:-0}" != 1 ] || echo "   note: NM_PRIMARY_GPU is ignored on Apple Silicon (the NVIDIA card drives no display there)"
+fi
 SELECTOR_SOURCE=""
 if [ "$PRIMARY" = 1 ]; then
   SELECTOR_SOURCE="$HERE/Library/Extensions/NVPrimarySelector.kext"
@@ -297,8 +415,9 @@ kmutil_blocker() {  # <kmutil log> <extensions folder>: prints a sentence for th
     [ -f "$x/Contents/Info.plist" ] || continue
     [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$x/Contents/Info.plist" 2>/dev/null)" = "$id" ] && { path=$x; break; }
   done
-  printf '%s needs %s, which this macOS does not have, so macOS cannot build a kernel collection while it is there. It is not part of this driver. Move %s out of %s (or load it from OpenCore instead), then run 1401 again' \
-    "$id" "$dep" "${path:-the kext with that identifier}" "$ext"
+  local oc=" (or load it from OpenCore instead)"; [ "${ARCH:-x86_64}" != arm64 ] || oc=""
+  printf '%s needs %s, which this macOS does not have, so macOS cannot build a kernel collection while it is there. It is not part of this driver. Move %s out of %s%s, then run 1401 again' \
+    "$id" "$dep" "${path:-the kext with that identifier}" "$ext" "$oc"
 }
 step "3. test kernel collection"
 T=$(mktemp -d /var/tmp/nullmoth.XXXX) && [ -n "$T" ] && mkdir -p "$T/repo" || die "create private preflight directory"
@@ -310,11 +429,21 @@ if [ "$PRIMARY" = 1 ]; then
 fi
 # macOS 26 kmutil silently skips kexts not owned by root ("No binaries or codeless kexts were provided").
 chown -R root:wheel "$T/repo" && chmod -R go-w "$T/repo" || die "preflight kext permissions"
-kmutil create -n aux --volume-root / ${KARG[@]+"${KARG[@]}"} -B $KB -S $KS --repository "$T/repo" -A "$T/aux.kc" -z >"$T/kmutil.log" 2>&1 || { tail -20 "$T/kmutil.log"; why=$(kmutil_blocker "$T/kmutil.log" "$EXT"); die "test kernel collection build failed${why:+: $why}"; }
+# On Apple Silicon kmutil create links only with a Kernel Debug Kit for this exact build; without one the test build
+# cannot run. That is not the gate there: kernelmanagerd links the kexts into the auxiliary collection after the user
+# approves them (step 5), with no KDK, and the kexts' imports were checked against this kernel when they were built.
+if [ "$ARCH" = arm64 ] && ! ls -d /Library/Developer/KDKs/*"$BUILD"* >/dev/null 2>&1; then
+  echo "   note: no Kernel Debug Kit for build $BUILD, so no test collection is built here; kernelmanagerd links the"
+  echo "         kexts after you approve them (step 5). Install the KDK for $BUILD from developer.apple.com to get this preflight."
+  ok "preflight done without a test collection"
+else
+kmutil create -n aux --volume-root / ${KARG[@]+"${KARG[@]}"} -B $KB -S $KS --repository "$T/repo" -A "$T/aux.kc" -z >"$T/kmutil.log" 2>&1 || { tail -20 "$T/kmutil.log"; why=$(kmutil_blocker "$T/kmutil.log" "$EXT"); hint=$(arm64_kmutil_hint "$T/kmutil.log"); die "test kernel collection build failed${why:+: $why}${hint:+
+$hint}"; }
 [ -s "$T/aux.kc" ] || die "test kernel collection build produced no output"
-INS=$(kmutil inspect -a x86_64 -A "$T/aux.kc" 2>/dev/null) || die "cannot inspect the test kernel collection"
+INS=$(kmutil inspect -a $KARCH -A "$T/aux.kc" 2>/dev/null) || die "cannot inspect the test kernel collection"
 for k in $KEXTS; do printf '%s\n' "$INS" | grep -oE '(com\.nullmoth\.[A-Za-z0-9]+|org\.hackintosh\.experimental\.NVPrimarySelector)' | grep -Fxq "$(primary_bundle_id "$k")" || { tail -20 "$T/kmutil.log"; die "kmutil refused com.nullmoth.$k (log above)"; }; done
-ok "test collection holds all four kexts"
+ok "test collection holds $KEXTS_WORD kexts"
+fi
 [ "${CHECK:-0}" = 1 ] && { rm -rf "$T"; echo; echo "CHECK PASS (nothing changed)"; exit 0; }
 
 BK=$(mktemp -d "/Library/NullMoth/backup-$(date +%Y%m%d-%H%M%S).XXXXXX") && [ -n "$BK" ] && [ -d "$BK" ] || die "create unique backup directory"
@@ -347,6 +476,7 @@ for k in $KEXTS; do
   if [ "$PRIMARY" = 1 ]; then source="$T/repo/$k.kext"; fi
   rm -rf "$EXT/$k.kext" && ditto "$source" "$EXT/$k.kext" || die "copy $k (restore from $BK)"
 done
+if [ "$ARCH" = x86_64 ]; then
 # both NVAccel builds stay on disk, so the first start after a macOS upgrade can switch to the matching one
 mkdir -p /Library/NullMoth && rm -rf /Library/NullMoth/kexts && ditto "$HERE/Library/NullMoth/kexts" /Library/NullMoth/kexts || die "copy per-macOS accelerators (restore from $BK)"
 for target in 15 26; do
@@ -358,6 +488,7 @@ for target in 15 26; do
   (cd "$dir" && find NVAccel.kext -type f -exec shasum -a 256 '{}' \;) > "$dir/SHA256SUMS" || die "cache manifest for macOS $target"
 done
 chown -R root:wheel /Library/NullMoth/kexts && chmod -R go-w /Library/NullMoth/kexts || die "cached accelerator permissions"
+fi
 echo "$MAJ" > /Library/NullMoth/os-major || die "record selected OS"
 mkdir -p "$GB" || die "create the bundle directory"
 # The card runs these images and the kernel reads them, so this directory must be ours. It used to live in
@@ -445,12 +576,16 @@ for c in $CACHEKEPT; do
 done
 chown -R _windowserver:wheel "$GB/nvmtl/aircache" "$GB/nvmtl/spvcache" || die "shader cache owner"
 chmod 0755 "$GB/nvmtl/aircache" "$GB/nvmtl/spvcache" || die "shared shader cache permissions"
+if [ "$ARCH" = x86_64 ]; then
 NEWKC="$KC.nullmoth-install-new"; rm -f "$NEWKC"
 kmutil create -n aux --volume-root / ${KARG[@]+"${KARG[@]}"} -B $KB -S $KS --repository "$EXT" -A "$NEWKC" -z >"$T/kmutil2.log" 2>&1 || die "live kernel collection build failed (restore from $BK)"
 [ -s "$NEWKC" ] || die "live kernel collection build produced no output (restore from $BK)"
-INS=$(kmutil inspect -a x86_64 -A "$NEWKC" 2>/dev/null) || die "cannot inspect the new kernel collection (restore from $BK)"
+INS=$(kmutil inspect -a $KARCH -A "$NEWKC" 2>/dev/null) || die "cannot inspect the new kernel collection (restore from $BK)"
 for k in $KEXTS; do printf '%s\n' "$INS" | grep -oE '(com\.nullmoth\.[A-Za-z0-9]+|org\.hackintosh\.experimental\.NVPrimarySelector)' | grep -Fxq "$(primary_bundle_id "$k")" || die "com.nullmoth.$k missing from the new collection (restore from $BK)"; done
 mv -f "$NEWKC" "$KC" || die "cannot publish the new kernel collection (restore from $BK)"
+else
+  arm64_stage_kexts
+fi
 INSTALLING=0
 rm -rf "$T"
 ok "installed"
@@ -476,6 +611,11 @@ step "6b. falling back to the previous driver if this one cannot start"
 nvram -d 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-nv-starts 2>/dev/null || true
 nvram -d 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-nv-ok 2>/dev/null || true
 LG=/Library/NullMoth/lastgood.sh; LGP=/Library/LaunchDaemons/com.nullmoth.lastgood.plist
+# On Apple Silicon the restored kexts reach the kernel only through kernelmanagerd's collection rebuild, so the job asks
+# for it before it restarts (they were allowed before, so no approval is pending). Empty on x86_64: the job is unchanged.
+ARM64_RESTAGE=""
+[ "$ARCH" != arm64 ] || ARM64_RESTAGE='for k in '"$KEXTS"'; do [ ! -d "'"$EXT"'/$k.kext" ] || kmutil load -p "'"$EXT"'/$k.kext" >> $LOG 2>&1; done
+'
 launchctl bootout system/com.nullmoth.lastgood 2>/dev/null || true
 rm -f "$LG" "$LGP"
 if [ -d "$BK/NVRM.kext" ]; then
@@ -502,7 +642,7 @@ rm -rf /Library/NullMoth/kexts "$FW"
 if [ -f "\$BK/AuxiliaryKernelExtensions.kc" ]; then cp -p "\$BK/AuxiliaryKernelExtensions.kc" "$KC"; else rm -f "$KC"; fi
 [ ! -f "\$BK/os-major" ] || cp -p "\$BK/os-major" /Library/NullMoth/os-major
 if [ -f "\$BK/driver-version" ]; then cp -p "\$BK/driver-version" /Library/NullMoth/driver-version; else rm -f /Library/NullMoth/driver-version; fi
-nvram -d \$V:nullmoth-nv-starts 2>/dev/null
+${ARM64_RESTAGE}nvram -d \$V:nullmoth-nv-starts 2>/dev/null
 echo "previous" > /Library/NullMoth/driver-restored
 done_job
 echo "\$(date) previous driver restored; restarting" >> \$LOG
@@ -530,6 +670,7 @@ step "6c. counting a start as good once the desktop is up"
 BG=/Library/NullMoth/bootguard.sh; BGP=/Library/LaunchDaemons/com.nullmoth.bootguard.plist
 launchctl bootout system/com.nullmoth.bootguard 2>/dev/null || true
 mkdir -p /Library/NullMoth /Library/LaunchDaemons || die "create the boot-guard job's folders"
+if [ "$ARCH" = x86_64 ]; then
 cat > "$BG.tmp" <<'EOF' || die "write the boot-guard job"
 #!/bin/bash
 # Written by the NVIDIA driver install: the desktop came up, so this start counts as good.
@@ -549,6 +690,32 @@ while [ "$n" -lt 48 ]; do
 done
 echo "$(date) no desktop within four minutes; the start keeps its count" >> $LOG
 EOF
+else
+# Apple Silicon: the desktop is on Apple's GPU, so "the desktop came up" says nothing about this driver, and no NVRMFB
+# clears the kernel's counter (nvrm_off.h) when a head lights: without this job two ordinary starts would switch a
+# working driver off. A start counts as good once NVRM.kext is loaded and GSP-RM is running on the card, which NVRM
+# reports by publishing nvrm-gpu-profile on the card's PCI device (NVRM.cpp, publishGpuProfile, after PASS 2). A card
+# that is not plugged in never starts NVRM and is never counted either way.
+cat > "$BG.tmp" <<'EOF' || die "write the boot-guard job"
+#!/bin/bash
+# Written by the NVIDIA driver install (Apple Silicon): NVRM is loaded and the card is up, so this start counts as good.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+V=7C436110-AB2A-4BBB-A880-FE41995C9F82; LOG=/Library/NullMoth/bootguard.log
+n=0
+while [ "$n" -lt 48 ]; do
+  if kmutil showloaded --list-only --bundle-identifier com.nullmoth.NVRM 2>/dev/null | grep -q com.nullmoth.NVRM \
+     && ioreg -r -c IOPCIDevice -d 1 2>/dev/null | grep -q '"nvrm-gpu-profile"'; then
+    nvram -d $V:nullmoth-nv-starts 2>/dev/null
+    # NVRAM writes can be refused under some boot policies; the kernel's own counter then keeps what it has
+    nvram $V:nullmoth-nv-ok=1 2>/dev/null || echo "$(date) NVRAM could not be written; the start is good but not recorded" >> $LOG
+    echo "$(date) NVRM is loaded and the card is up; this start counts as good" >> $LOG
+    exit 0
+  fi
+  n=$((n + 1)); sleep 5
+done
+echo "$(date) NVRM did not bring the card up within four minutes; the start keeps its count" >> $LOG
+EOF
+fi
 chmod 755 "$BG.tmp" && chown root:wheel "$BG.tmp" && mv -f "$BG.tmp" "$BG" || die "install the boot-guard job"
 cat > "$BGP" <<EOF || die "write the boot-guard job's plist"
 <?xml version="1.0" encoding="UTF-8"?>
@@ -558,18 +725,40 @@ cat > "$BGP" <<EOF || die "write the boot-guard job's plist"
 <key>RunAtLoad</key><true/></dict></plist>
 EOF
 chmod 644 "$BGP" && chown root:wheel "$BGP" || die "boot-guard job permissions"
-ok "a start counts as good once the desktop is up"
+if [ "$ARCH" = x86_64 ]; then ok "a start counts as good once the desktop is up"
+else ok "a start counts as good once NVRM has brought the card up"; fi
 
 ba=$(nvram boot-args 2>/dev/null | cut -f2-)
+if [ "$ARCH" = x86_64 ]; then
 for a in nvfb=1 nvaccel=1; do case " $ba " in *" $a "*) ;; *) echo "   NOTE: boot-args lack '$a' — add it in your OpenCore config.plist (README: Install — by hand), or let the 1401 Mac app set OpenCore up";; esac; done
 # WhateverGreen's boot screen copy (on unless gfxrst=4) reads a console mapping macOS may already have freed when this
 # driver's display first opens, and the Mac panics in IOFramebuffer::postOpen.
 if kmutil showloaded --list-only --bundle-identifier as.vit9696.WhateverGreen 2>/dev/null | grep -q WhateverGreen; then
   case " $ba " in *" gfxrst=4 "*) ;; *) echo "   NOTE: WhateverGreen is loaded and boot-args lack 'gfxrst=4' — add it in your OpenCore config.plist, or the Mac can panic when the NVIDIA display first opens";; esac
 fi
+else
+# What the Apple Silicon kexts read (grep PE_parse_boot_argn kexts/NVRM kexts/NVAccelArm): nothing is needed to start
+# NVRM, and NVAccelArm reads only nvaccelfake=1 (its bring-up recording mode). nvfb=1 belongs to NVRMFB and nvaccel=1 to
+# the x86 NVAccel, neither of which exists here. The AMFI arguments are what let WindowServer and every app load the
+# unsigned Metal plugin bundle, as on Intel. OpenCore and WhateverGreen do not exist on this Mac: boot-args live in NVRAM,
+# which macOS may write only under Permissive Security; otherwise they are set from recoveryOS Terminal.
+miss=""
+for a in amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0; do case " $ba " in *" $a "*) ;; *) miss="$miss $a";; esac; done
+if [ -n "$miss" ]; then
+  echo "   NOTE: boot-args lack$miss — without them WindowServer and apps cannot load the Metal plugin (the kexts still load)."
+  echo "         Set them from macOS under Permissive Security, or from recoveryOS Terminal (power button held at start > Options > Utilities > Terminal):"
+  echo "           sudo nvram boot-args=\"$(echo $ba$miss)\""
+fi
+echo "   Optional boot-args read by these kexts: -nvoff (keeps the driver off), nvaccelfake=1 (NVAccelArm answers Metal's probes),"
+echo "   -nvrmnogo, -nvrmnopm, nvrmsettle=<ms>, nvrmholdcap=<s>, nvrmdiag=1, nvrmmapowner=0, -nvrmsmallbar, nvmaxbpc=<n>."
+fi
 
 echo; echo "Done. Reboot now: sudo shutdown -r now"
-if [ "$ALLOWED" = "$(echo $KEXTS | wc -w | tr -d ' ')" ]; then
+if [ "$ARCH" = arm64 ] && [ "$ARM64_APPROVE" = 1 ]; then
+  echo "macOS is waiting for you: open System Settings > Privacy & Security, allow the NullMoth extensions (the notice may say"
+  echo "\"System Extension Blocked\"), and restart when macOS asks. The restart after the approval builds the kernel collection,"
+  echo "so the driver is up from the start after that one."
+elif [ "$ALLOWED" = "$(echo $KEXTS | wc -w | tr -d ' ')" ]; then
   echo "This is an update of extensions you already allowed: one restart is enough. macOS may show a notice that they were"
   echo "updated; the new driver loads on this restart without allowing them again."
 else

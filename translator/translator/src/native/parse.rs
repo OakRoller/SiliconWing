@@ -1051,6 +1051,10 @@ fn strip_leading_fast_math_flags(mut s: &str) -> &str {
 }
 
 pub(super) fn parse_struct_fields(s: &str) -> Result<Vec<LlType>, String> {
+    // `{}`: an empty struct (a DXR miss shader's empty ray payload, Metal Shader Converter output)
+    if s.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     split_top_level(s, ',')
         .into_iter()
         .map(parse_type)

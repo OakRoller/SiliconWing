@@ -1,0 +1,354 @@
+diff --git a/src/compiler/spirv/vtn_bindgen2.c b/src/compiler/spirv/vtn_bindgen2.c
+index 4d46f9a..e773c74 100644
+--- a/src/compiler/spirv/vtn_bindgen2.c
++++ b/src/compiler/spirv/vtn_bindgen2.c
+@@ -13,7 +13,15 @@
+ #include "nir_precompiled.h"
+ #include "nir_serialize.h"
+ 
++static void
++vtn_bindgen_log(void *private_data, enum nir_spirv_debug_level level, size_t spirv_offset, const char *message)
++{
++   fprintf(stderr, "vtn_bindgen2: spirv_to_nir %s at word %zu: %s\n",
++           level == NIR_SPIRV_DEBUG_LEVEL_ERROR ? "ERROR" : level == NIR_SPIRV_DEBUG_LEVEL_WARNING ? "warning" : "info", spirv_offset, message);
++}
++
+ static const struct spirv_to_nir_options spirv_options = {
++   .debug = { .func = vtn_bindgen_log },
+    .environment = NIR_SPIRV_OPENCL,
+    .shared_addr_format = nir_address_format_62bit_generic,
+    .global_addr_format = nir_address_format_62bit_generic,
+@@ -122,6 +130,10 @@ compile(void *memctx, const uint32_t *spirv, size_t spirv_size)
+    nir_shader *nir =
+       spirv_to_nir(spirv, spirv_size / 4, NULL, MESA_SHADER_KERNEL,
+                    "library", &spirv_options, nir_options);
++   if (nir == NULL) {
++      fprintf(stderr, "vtn_bindgen2: spirv_to_nir failed\n");
++      exit(1);
++   }
+    nir_validate_shader(nir, "after spirv_to_nir");
+    ralloc_steal(memctx, nir);
+ 
+diff --git a/src/nouveau/headers/nv_push.h b/src/nouveau/headers/nv_push.h
+index d43d380..8b94abd 100644
+--- a/src/nouveau/headers/nv_push.h
++++ b/src/nouveau/headers/nv_push.h
+@@ -132,6 +132,8 @@ __push_verify(struct nv_push *push)
+     * vk_meta_draw_volume) reached here with an empty method and aborted Chess,
+     * mediaanalysisd and several video apps.  Warn once and continue, as the
+     * stale rasterization-samples assert in nvk_cmd_draw.c was downgraded. */
++#ifndef __OPENCL_VERSION__   /* host only: this header is also compiled as OpenCL C by mesa_clc, where a static
++                                 with an initializer becomes a global Mesa's SPIR-V reader rejects */
+    if (last_count == 0) {
+       static int warned;
+       if (!warned) {
+@@ -139,6 +141,7 @@ __push_verify(struct nv_push *push)
+          fprintf(stderr, "nvk: empty push method header (count 0); continuing\n");
+       }
+    }
++#endif
+ }
+ 
+ static inline void
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.c b/src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.c
+index 0cf64c1..7736fd0 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.c
+@@ -165,7 +165,7 @@ NvU32 nvRmApiMapMemory(NvRmApi *api, NvU32 hDevice, NvU32 hMemory, NvU64 offset,
+ 	}
+ 
+ 	mapping->address = NULL;
+-	int memFd = NVRM_OPEN(nodeName);
++	int memFd = NVRM_OPEN_MAP(nodeName);
+ 	if (memFd < 0) {
+ 		return NV_ERR_GENERIC;
+ 	}
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.h b/src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.h
+index 9314ead..6876577 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.h
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvRmApi.h
+@@ -23,12 +23,14 @@
+ #ifdef __APPLE__
+ #include "nvrm_xnu.h"
+ #define NVRM_OPEN(path)         nvrm_xnu_open(path)
++#define NVRM_OPEN_MAP(path)     nvrm_xnu_open_map(path)
+ #define NVRM_CLOSE(fd)          nvrm_xnu_close(fd)
+ #define NVRM_MMAP(fd, len)      nvrm_xnu_mmap((fd), (len))
+ #define NVRM_MMAP_WC(fd, len, wc) nvrm_xnu_mmap_wc((fd), (len), (wc))
+ #define NVRM_MUNMAP(addr, len)  nvrm_xnu_munmap((addr), (len))
+ #else
+ #define NVRM_OPEN(path)         open((path), O_RDWR | O_CLOEXEC)
++#define NVRM_OPEN_MAP(path)     open((path), O_RDWR | O_CLOEXEC)
+ #define NVRM_CLOSE(fd)          close(fd)
+ #define NVRM_MMAP(fd, len)      mmap(0, (len), PROT_READ|PROT_WRITE, MAP_SHARED, (fd), 0)
+ #define NVRM_MMAP_WC(fd, len, wc) NVRM_MMAP((fd), (len))
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvRmSemSurf.c b/src/nouveau/vulkan/nvkmd/nvrm/nvRmSemSurf.c
+index 2bd0054..c075eec 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvRmSemSurf.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvRmSemSurf.c
+@@ -15,6 +15,8 @@ portAtomicMemoryFenceFull(void)
+ {
+ #if defined(__i386__) || defined(__x86_64__)
+ 	__asm__ __volatile__ ("mfence" : : : "memory");
++#elif defined(__aarch64__)
++	__asm__ __volatile__ ("dmb ish" : : : "memory");
+ #elif defined(__riscv)
+ 	__asm__ __volatile__ ("fence" : : : "memory");
+ #else
+@@ -27,6 +29,8 @@ portAtomicMemoryFenceLoad(void)
+ {
+ #if defined(__i386__) || defined(__x86_64__)
+ 	__asm__ __volatile__ ("lfence" : : : "memory");
++#elif defined(__aarch64__)
++	__asm__ __volatile__ ("dmb ishld" : : : "memory");
+ #elif defined(__riscv)
+ 	__asm__ __volatile__ ("fence" : : : "memory");
+ #else
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
+index 9c90215..9cb8f92 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
+@@ -181,6 +181,8 @@ nvkmd_nvrm_wait_backoff(int64_t waited_ns)
+    if (waited_ns < 50000) {
+ #if defined(__x86_64__)
+       for (int s = 0; s < 64; s++) __builtin_ia32_pause();
++#elif defined(__aarch64__)
++      for (int s = 0; s < 64; s++) __asm__ __volatile__ ("yield");
+ #endif
+       return;
+    }
+@@ -1135,6 +1137,8 @@ nvkmd_nvrm_exec_ctx_flush(struct nvkmd_ctx *_ctx,
+          if (waitedUs < 20) {
+ #if defined(__x86_64__)
+             for (int s = 0; s < 64; s++) __builtin_ia32_pause();
++#elif defined(__aarch64__)
++            for (int s = 0; s < 64; s++) __asm__ __volatile__ ("yield");
+ #endif
+             continue;
+          }
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c
+index 7e09f85..67100db 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c
+@@ -176,6 +176,16 @@ nvkmd_nvrm_alloc_tiled_mem(struct nvkmd_dev *_dev,
+ 
+    const uint32_t mem_align_B = _dev->pdev->bind_align_B;
+    size_B = align64(size_B, mem_align_B);
++   /* Guard slack. On Metal a heap packs allocations back to back, so a shader that reads a little past a buffer's
++    * end (a tile loop rounded up, a raw pointer plus padding) lands in the neighbour and nothing notices. Here every
++    * allocation is its own GPU mapping, and the same read is an MMU fault: Cyberpunk 2077 faulted on the first page
++    * after a 4.4 MB VRAM allocation (FAULT_PTE at exactly mapping end, 2026-11-04 03:12). 64 KB of mapped slack after
++    * every allocation of 256 KB or more buys the heap's tolerance for ~1.5% of the memory (NVK_NVRM_NO_GUARD=1 off). */
++   {
++      static int guard = -1;
++      if (guard < 0) { const char *e = nvmtl_cfg_getenv("NVK_NVRM_NO_GUARD"); guard = !(e && e[0] == '1'); }
++      if (guard && size_B >= (256u << 10)) size_B += 64u << 10;
++   }
+ 
+    assert(util_is_power_of_two_or_zero64(align_B));
+    const uint64_t va_align_B = MAX2(mem_align_B, align_B);
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.c b/src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.c
+index 1919307..5b78f52 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.c
+@@ -21,7 +21,7 @@ static int gTrace = -1;
+ #define NVRM_XNU_MAX_MAP 16384
+ enum { SEL_GO = 0, SEL_ESC = 1, SEL_GETFD = 2, SEL_BINDFD = 3 };
+ static io_connect_t gConn[NVRM_XNU_MAX_FD];
+-static struct { void *addr; size_t len; io_connect_t conn; } gMaps[NVRM_XNU_MAX_MAP];
++static struct { void *addr; size_t len; io_connect_t conn; int fd; } gMaps[NVRM_XNU_MAX_MAP];   // fd >= 0: a multiplexed mapping (see nvrm_xnu_open_map)
+ static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
+ #define NVRM_XNU_POOL 128
+ static io_connect_t gPoolConn[NVRM_XNU_POOL];
+@@ -29,6 +29,50 @@ static uint32_t     gPoolType[NVRM_XNU_POOL];
+ static int          gPoolN;
+ static uint32_t     gConnType[NVRM_XNU_MAX_FD];
+ static unsigned long gPoolHit, gPoolMiss, gPoolPut, gPoolDrop;
++/* Mappings multiplexed on one long-lived connection per node type. Each RM mapping used to open a user client of its
++ * own and keep it until the unmap; Cyberpunk 2077 held 876 of them, IOKit's per-service child ceiling (~1020) made
++ * every further attach wait 15 s and fail, and the engine watchdog killed the game (2026-11-04). Now a map "opens" a
++ * virtual fd (a /dev/null descriptor, for a unique number) bound on the shared connection, the kernel keeps the
++ * mapping under that number (IOConnectMapMemory64's memoryType), and the unmap names it again. gMapLock is held from
++ * nvrm_xnu_open_map to the NVRM_CLOSE of that fd: the bind, the MAP_MEMORY ioctl and the map must not interleave. */
++static io_connect_t    gMapConn[2];
++static pthread_mutex_t gMapLock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_t       gMapHolder; static int gMapHeld;
++static uint8_t         gVirt[NVRM_XNU_MAX_FD], gVirtMapped[NVRM_XNU_MAX_FD];
++#define SEL_UNMAPDONE 7
++static io_connect_t open_conn(uint32_t type)
++{
++    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVAccel"));
++    uint32_t open_type = 0x4E560000u | type;
++    if (!svc) { svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVRM")); open_type = type; }
++    if (!svc) return 0;
++    io_connect_t conn = 0;
++    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), open_type, &conn);
++    if (kr != KERN_SUCCESS && open_type != type) {
++        IOObjectRelease(svc);
++        svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NVRM"));
++        if (svc) kr = IOServiceOpen(svc, mach_task_self(), type, &conn);
++    }
++    if (svc) IOObjectRelease(svc);
++    return kr == KERN_SUCCESS ? conn : 0;
++}
++static void map_lock_release(void)
++{
++    if (gMapHeld && pthread_equal(gMapHolder, pthread_self())) { gMapHeld = 0; pthread_mutex_unlock(&gMapLock); }
++}
++int nvrm_xnu_open_map(const char *node)
++{
++    uint32_t type = (node && strstr(node, "ctl")) ? 0 : 1;
++    pthread_mutex_lock(&gMapLock); gMapHeld = 1; gMapHolder = pthread_self();
++    if (!gMapConn[type]) gMapConn[type] = open_conn(type);
++    if (!gMapConn[type]) { fprintf(stderr, "nvrm_xnu: no connection for mappings (type %u)\n", type); map_lock_release(); errno = EIO; return -1; }
++    int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
++    if (fd < 0 || fd >= NVRM_XNU_MAX_FD) { if (fd >= 0) close(fd); map_lock_release(); errno = EMFILE; return -1; }
++    uint64_t in = (uint64_t)fd;
++    if (IOConnectCallScalarMethod(gMapConn[type], SEL_BINDFD, &in, 1, NULL, NULL) != KERN_SUCCESS) { close(fd); map_lock_release(); errno = EIO; return -1; }
++    pthread_mutex_lock(&gLock); gConn[fd] = gMapConn[type]; gConnType[fd] = type; gVirt[fd] = 1; gVirtMapped[fd] = 0; pthread_mutex_unlock(&gLock);
++    return fd;
++}
+ 
+ static io_connect_t pool_take(uint32_t type)
+ {
+@@ -134,13 +178,15 @@ void *nvrm_xnu_mmap(int fd, size_t length) { return nvrm_xnu_mmap_wc(fd, length,
+ void *nvrm_xnu_mmap_wc(int fd, size_t length, int writeCombine)
+ {
+     io_connect_t conn = conn_of(fd); if (!conn) { errno = EBADF; return MAP_FAILED; }
++    const int virt = (fd >= 0 && fd < NVRM_XNU_MAX_FD && gVirt[fd]) ? fd : -1;
+     mach_vm_address_t addr = 0; mach_vm_size_t len = 0;
+-    kern_return_t kr = IOConnectMapMemory64(conn, 0, mach_task_self(), &addr, &len,
++    kern_return_t kr = IOConnectMapMemory64(conn, virt >= 0 ? (uint32_t)virt : 0, mach_task_self(), &addr, &len,
+                                             kIOMapAnywhere | (writeCombine ? kIOMapWriteCombineCache : 0));
+     if (kr != KERN_SUCCESS) { fprintf(stderr, "nvrm_xnu: IOConnectMapMemory64 -> 0x%08x\n", kr); errno = EIO; return MAP_FAILED; }
+     pthread_mutex_lock(&gLock);
+     int stored = 0;
+-    for (int i = 0; i < NVRM_XNU_MAX_MAP; i++) if (!gMaps[i].addr) { gMaps[i].addr = (void *)(uintptr_t)addr; gMaps[i].len = (size_t)len; gMaps[i].conn = conn; stored = 1; break; }
++    for (int i = 0; i < NVRM_XNU_MAX_MAP; i++) if (!gMaps[i].addr) { gMaps[i].addr = (void *)(uintptr_t)addr; gMaps[i].len = (size_t)len; gMaps[i].conn = conn; gMaps[i].fd = virt; stored = 1; break; }
++    if (virt >= 0) gVirtMapped[virt] = 1;
+     pthread_mutex_unlock(&gLock);
+     if (!stored) {
+         static int told; if (!told) { told = 1;
+@@ -154,9 +200,19 @@ static int maps_on(io_connect_t conn) { int n = 0; for (int i = 0; i < NVRM_XNU_
+ static int pending_close(io_connect_t conn) { for (int i = 0; i < NVRM_XNU_MAX_MAP; i++) if (gPendingClose[i] == conn) return i; return -1; }
+ int nvrm_xnu_munmap(void *addr, size_t length)
+ {
+-    io_connect_t conn = 0;
++    io_connect_t conn = 0; int virt = -1;
++    pthread_mutex_lock(&gLock);
++    for (int i = 0; i < NVRM_XNU_MAX_MAP; i++) if (gMaps[i].addr == addr) { conn = gMaps[i].conn; virt = gMaps[i].fd; gMaps[i].addr = NULL; gMaps[i].fd = -1; break; }
++    if (virt >= 0) { gVirt[virt] = 0; gVirtMapped[virt] = 0; }
++    pthread_mutex_unlock(&gLock);
++    if (virt >= 0) {
++        IOConnectUnmapMemory64(conn, (uint32_t)virt, mach_task_self(), (mach_vm_address_t)(uintptr_t)addr);
++        uint64_t in = (uint64_t)virt;
++        IOConnectCallScalarMethod(conn, SEL_UNMAPDONE, &in, 1, NULL, NULL);
++        close(virt);
++        return 0;
++    }
+     pthread_mutex_lock(&gLock);
+-    for (int i = 0; i < NVRM_XNU_MAX_MAP; i++) if (gMaps[i].addr == addr) { conn = gMaps[i].conn; gMaps[i].addr = NULL; break; }
+     int closeNow = 0, pi = -1;
+     if (conn && maps_on(conn) == 0 && (pi = pending_close(conn)) >= 0) { gPendingClose[pi] = 0; closeNow = 1; }
+     pthread_mutex_unlock(&gLock);
+@@ -167,6 +223,17 @@ int nvrm_xnu_munmap(void *addr, size_t length)
+ }
+ int nvrm_xnu_close(int fd)
+ {
++    if (fd >= 0 && fd < NVRM_XNU_MAX_FD && gVirt[fd]) {
++        // a multiplexed mapping's fd: the connection stays (it is the shared one); detach the bound number so a
++        // later connection that binds the same number is the only one answering for it; the number itself stays
++        // reserved while the mapping lives (nvrm_xnu_munmap closes it)
++        pthread_mutex_lock(&gLock); const int mapped = gVirtMapped[fd]; io_connect_t conn = gConn[fd]; gConn[fd] = 0; pthread_mutex_unlock(&gLock);
++        uint64_t unbound = (uint64_t)(int64_t)-2;
++        if (conn) IOConnectCallScalarMethod(conn, SEL_BINDFD, &unbound, 1, NULL, NULL);
++        map_lock_release();
++        if (!mapped) { gVirt[fd] = 0; return close(fd); }
++        return 0;
++    }
+     io_connect_t conn = conn_of(fd);
+     if (conn) {
+         pthread_mutex_lock(&gLock);
+diff --git a/src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.h b/src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.h
+index f0d8bec..96c3455 100644
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.h
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvrm_xnu.h
+@@ -9,6 +9,7 @@
+ extern "C" {
+ #endif
+ int   nvrm_xnu_open(const char *node);
++int   nvrm_xnu_open_map(const char *node);   /* a virtual fd for one mapping, multiplexed on a shared connection; NVRM_CLOSE it after the map */
+ int   nvrm_xnu_ioctl(int fd, uint32_t cmd, void *data, uint32_t size);
+ void *nvrm_xnu_mmap(int fd, size_t length);
+ void *nvrm_xnu_mmap_wc(int fd, size_t length, int writeCombine);
+diff --git a/src/util/cache_ops_aarch64.c b/src/util/cache_ops_aarch64.c
+index d56ab8a..65117b5 100644
+--- a/src/util/cache_ops_aarch64.c
++++ b/src/util/cache_ops_aarch64.c
+@@ -26,6 +26,25 @@
+ #include "util/macros.h"
+ #include "util/u_atomic.h"
+ 
++#ifdef __APPLE__
++#include <sys/sysctl.h>
++
++/* macOS does not let EL0 read CTR_EL0 (SCTLR_EL1.UCT is clear: the mrs is an
++ * illegal-instruction fault, SIGILL, measured on an M1 Pro). The kernel
++ * publishes the cache line size instead; Apple's own libc takes it from there.
++ * The data-cache maintenance instructions by VA (dc cvac / dc civac) are
++ * allowed, so only the two CTR_EL0 readers change.
++ */
++static uint32_t
++apple_cacheline_size(void)
++{
++   int64_t v = 0;
++   size_t len = sizeof(v);
++   if (sysctlbyname("hw.cachelinesize", &v, &len, NULL, 0) != 0 || v <= 0)
++      v = 128;
++   return (uint32_t)v;
++}
++#else
+ static uint32_t
+ get_ctr_el0(void)
+ {
+@@ -33,12 +52,7 @@ get_ctr_el0(void)
+    __asm("mrs\t%x0, ctr_el0" : "=r"(ctr_el0));
+    return ctr_el0;
+ }
+-
+-static uint32_t
+-get_ctr_cwg(void)
+-{
+-   return (get_ctr_el0() >> 24) & 0xf;
+-}
++#endif
+ 
+ size_t
+ util_cache_granularity(void)
+@@ -60,7 +74,11 @@ util_cache_granularity(void)
+     * maximum across all CPU cores so this should really be the maximum that
+     * drivers and clients can assume.
+     */
++#ifdef __APPLE__
++   size = apple_cacheline_size();
++#else
+    size = 4 << ((get_ctr_el0() >> 24) & 0xf);
++#endif
+ 
+    p_atomic_set(&cached_size, size);
+    return size;
+@@ -86,7 +104,14 @@ get_dmin_line(void)
+     * minimum across all CPU cores so this should be safe no matter what core
+     * we happen to be living on.
+     */
++#ifdef __APPLE__
++   /* The smallest line any Apple core has used is 64 bytes; stepping by
++    * that is correct (if redundant) on 128-byte-line cores.
++    */
++   size = MIN2(apple_cacheline_size(), 64);
++#else
+    size = 4 << ((get_ctr_el0() >> 16) & 0xf);
++#endif
+ 
+    p_atomic_set(&cached_size, size);
+    return size;

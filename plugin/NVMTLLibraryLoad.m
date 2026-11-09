@@ -24,6 +24,8 @@ void nvlog(const char *fmt, ...);
 
 #import <CommonCrypto/CommonDigest.h>
 #define NVMTL_AIR_OPT   "/Library/GPUBundles/nvmtl/air-opt"
+// Apple's AIR-capable libLLVM, the fallback bitcode reader when no air-runtime is bundled (same library NVMTLGL.m uses)
+#define NVMTL_SYSTEM_LLVM "/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/libLLVM.dylib"
 #include <unistd.h>
 static inline const char *nvmtl_pick_ll(const char *staged, const char *dev) {
     return access(staged, R_OK) == 0 ? staged : dev;
@@ -123,6 +125,17 @@ static int nvmtl_xlate_ready(void) {
         if (!xlate_to_uniform) nvlog("translate: no nvmtl_table_to_uniform in this translator - a module that address lowering refuses is refused outright while the table is Uniform");
         xlate_promote_uniform = (nvmtl_promote_uniform_fn)dlsym(h, "nvmtl_promote_gl_uniform");
         xlate_free = (nvmtl_free_fn)dlsym(h, "nvmtl_translate_free");
+        {   // shmirror (nvmtl_shm.c): store instrumentation, and address lowering that keeps no descriptor a shader stores to
+            extern int (*nvmtl_shm_instrument_fn)(const uint8_t *, size_t, uint8_t **, size_t *, uint32_t *, char *, size_t);
+            extern void (*nvmtl_shm_free_fn)(uint8_t *, size_t); extern uint32_t nvmtl_shm_spec_id; int nvmtl_shm_on(void);
+            if (nvmtl_shm_on()) {
+                nvmtl_shm_instrument_fn = (int (*)(const uint8_t *, size_t, uint8_t **, size_t *, uint32_t *, char *, size_t))dlsym(h, "nvmtl_spv_instrument_stores");
+                nvmtl_shm_free_fn = xlate_free;
+                uint32_t (*sid)(void) = (uint32_t (*)(void))dlsym(h, "nvmtl_spv_store_note_spec_id"); if (sid) nvmtl_shm_spec_id = sid();
+                void (*lsr)(uint32_t) = (void (*)(uint32_t))dlsym(h, "nvmtl_shm_lower_stored_roots"); if (lsr) lsr(1);
+                nvlog("shmirror: translator %s store instrumentation, %s stored-root lowering", nvmtl_shm_instrument_fn ? "HAS" : "has NO", lsr ? "with" : "WITHOUT");
+            }
+        }
         xlate_sampler = (nvmtl_sampler_fn)dlsym(h, "nvmtl_translate_samplers");
         xlate_tglen = (nvmtl_tglen_fn)dlsym(h, "nvmtl_translate_set_threadgroup_lengths");
         if (!xlate_tglen) nvlog("translate: no nvmtl_translate_set_threadgroup_lengths in this translator — dynamic threadgroup memory stays unsized (MPS convolutions read zeros)");
@@ -655,7 +668,15 @@ static BOOL nvmtl_bitcode_reader_ready(void) {
         NSString *path = [[@(info.dli_fname) stringByDeletingLastPathComponent]
                          stringByAppendingPathComponent:@"air-runtime/libLLVM.dylib"];
         void *library = dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
-        if (!library) { nvlog("library: in-memory bitcode reader unavailable: %s", dlerror()); return; }
+        if (!library) {
+            // No bundled reader (the Apple Silicon build ships none): Apple's own GPUCompiler libLLVM reads AIR bitcode
+            // and carries the same C API; it lives in the shared cache, so dlopen by path works although the file is
+            // not on disk. The GL path (NVMTLGL.m) has used this library for the same reason since macOS 26.
+            const char *why = dlerror();
+            library = dlopen(NVMTL_SYSTEM_LLVM, RTLD_NOW | RTLD_LOCAL);
+            if (library) nvlog("library: bitcode reader is the system GPUCompiler libLLVM (no bundled air-runtime: %s)", why ? why : "?");
+            else { nvlog("library: in-memory bitcode reader unavailable: %s; system libLLVM: %s", why ? why : "?", dlerror()); return; }
+        }
 #define NV_LLVM_LOAD(name) do { nv##name = (void *)dlsym(library, #name); if (!nv##name) { nvlog("library: bitcode reader missing " #name); return; } } while (0)
         NV_LLVM_LOAD(LLVMContextCreate);
         NV_LLVM_LOAD(LLVMContextDispose);
@@ -956,8 +977,20 @@ NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage, 
         if (hit) { gSpvHit++; nvmtl_cache_touch(spvp); }
         else {
             gSpvMiss++;
+            {   // NVMTL_DUMP_ENTRY=<name>: write that entry's translator input to ~/Library/Logs/nvmtl/entry-<name>.<stage>.ll
+                const char *de = getenv("NVMTL_DUMP_ENTRY");
+                if (de && !strcmp(de, name.UTF8String)) {
+                    NSString *p = [NSString stringWithFormat:@"%s/Library/Logs/nvmtl/entry-%@.%@.ll", getenv("HOME") ?: "/tmp", name, stage];
+                    NSError *we = nil; BOOL ok = [ll writeToFile:p atomically:NO encoding:NSUTF8StringEncoding error:&we];
+                    nvlog("library: entry %s input (%lu chars) -> %s %s", name.UTF8String, (unsigned long)ll.length, p.UTF8String, ok ? "written" : we.localizedDescription.UTF8String); } }
             if (xlate(ll.UTF8String, stage.UTF8String, &spv, &spvn, err, sizeof err) != 0) {
-                nvlog("library: translate %s (%s) FAILED: %s", name.UTF8String, stage.UTF8String, err); if (error) *error = @(err); return nil;
+                nvlog("library: translate %s (%s) FAILED: %s", name.UTF8String, stage.UTF8String, err);
+                {   // the input that failed, for a repro: ~/Library/Logs/nvmtl/xlate-fail-<name>.ll (first 32 per process)
+                    static _Atomic int nfail; if (atomic_fetch_add(&nfail, 1) < 32) {
+                        NSString *p = [NSString stringWithFormat:@"%s/Library/Logs/nvmtl/xlate-fail-%@.%@.ll", getenv("HOME") ?: "/tmp", name, stage];
+                        NSError *we = nil; BOOL ok = [ll writeToFile:p atomically:NO encoding:NSUTF8StringEncoding error:&we];
+                        nvlog("library: failing input (%lu chars) -> %s %s", (unsigned long)ll.length, p.UTF8String, ok ? "written" : we.localizedDescription.UTF8String); } }
+                if (error) *error = @(err); return nil;
             }
             spvData = [NSData dataWithBytes:spv length:spvn];
             if (spvp) {
@@ -1556,7 +1589,11 @@ static NSString *nvmtl_air_quoted_before(NSString *line, NSUInteger at, NSUInteg
     if (start) *start = q.location;
     return [line substringWithRange:NSMakeRange(q.location + 2, at - 1 - (q.location + 2))];
 }
-static void nvmtl_air_walk_struct(NSDictionary *nodes, NSString *node, NSString *bufKey, NSMutableDictionary *members, NSMutableDictionary *types, NSMutableSet *seen) {
+static void nvmtl_air_plain_struct(NSDictionary *nodes, NSString *node, NSInteger loc, NSMutableDictionary *plain);
+// pointees: "<buffer>:<id>" -> { size, align, members (as nvmtl_air_plain_struct gives them) } for each argument-buffer
+// member that points at a buffer, from that member's air.buffer node (air.arg_type_size, air.arg_type_align_size and its
+// own air.struct_type_info). The reflected MTLPointerType carries them, as Apple's does.
+static void nvmtl_air_walk_struct(NSDictionary *nodes, NSString *node, NSString *bufKey, NSMutableDictionary *members, NSMutableDictionary *types, NSMutableSet *seen, NSMutableDictionary *pointees) {
     if (!node || [seen containsObject:node]) return;
     [seen addObject:node];
     NSString *line = nodes[node]; if (!line) return;
@@ -1576,6 +1613,16 @@ static void nvmtl_air_walk_struct(NSDictionary *nodes, NSString *node, NSString 
             if (argLine) {
                 id_ = nvmtl_air_i32_after(argLine, @"air.location_index");
                 if (id_ < 0) id_ = [[argLine substringFromIndex:MIN(argLine.length, (NSUInteger)[argLine rangeOfString:@"!{i32 "].location + 6)] integerValue];
+                if (pointees && id_ >= 0 && [argLine rangeOfString:@"!\"air.buffer\""].location != NSNotFound) {
+                    NSMutableDictionary *pe = [NSMutableDictionary new];
+                    NSInteger sz = nvmtl_air_i32_after(argLine, @"air.arg_type_size"), al = nvmtl_air_i32_after(argLine, @"air.arg_type_align_size");
+                    if (sz >= 0) pe[@"size"] = @(sz);
+                    if (al > 0) pe[@"align"] = @(al);
+                    pe[@"write"] = @([argLine rangeOfString:@"!\"air.read_write\""].location != NSNotFound || [argLine rangeOfString:@"!\"air.write\""].location != NSNotFound);
+                    NSString *pst = nvmtl_air_node_after(argLine, @"air.struct_type_info", 0, NULL);
+                    if (pst) { NSMutableDictionary *tmp = [NSMutableDictionary new]; nvmtl_air_plain_struct(nodes, pst, 0, tmp); if (tmp[@0]) pe[@"members"] = tmp[@0]; }
+                    pointees[[NSString stringWithFormat:@"%@:%ld", bufKey, (long)id_]] = pe;
+                }
             }
         }
         if (name && id_ >= 0) {
@@ -1614,8 +1661,8 @@ NSDictionary *nvmtl_air_names(NVMTLFunction *fn)
     @synchronized (fn) {
         if (fn->_airNames) return fn->_airNames;
         NSMutableDictionary *args = [NSMutableDictionary new], *members = [NSMutableDictionary new], *types = [NSMutableDictionary new];
-        NSMutableDictionary *plain = [NSMutableDictionary new];
-        fn->_airNames = @{ @"args": args, @"members": members, @"types": types, @"plain": plain };
+        NSMutableDictionary *plain = [NSMutableDictionary new], *pointees = [NSMutableDictionary new];
+        fn->_airNames = @{ @"args": args, @"members": members, @"types": types, @"plain": plain, @"pointees": pointees };
         NSString *ll = fn->_air, *fname = fn->_fname;
         if (!ll.length || !fname.length) return fn->_airNames;
         NSMutableDictionary *nodes = [NSMutableDictionary new];
@@ -1652,7 +1699,7 @@ NSDictionary *nvmtl_air_names(NVMTLFunction *fn)
             NSString *tn = nvmtl_air_quoted_after(line, @"air.arg_type_name", 0); if (tn) types[k] = tn;
             if ([kind isEqualToString:@"buffer"]) {
                 NSString *st = nvmtl_air_node_after(line, @"air.struct_type_info", 0, NULL);
-                if (st) nvmtl_air_walk_struct(nodes, st, [NSString stringWithFormat:@"%ld", (long)loc], members, types, [NSMutableSet new]);
+                if (st) nvmtl_air_walk_struct(nodes, st, [NSString stringWithFormat:@"%ld", (long)loc], members, types, [NSMutableSet new], pointees);
                 if (st) nvmtl_air_plain_struct(nodes, st, loc, plain);
             }
         }
@@ -2195,8 +2242,23 @@ static NVMTLFunction *nvmtl_link_dylibs(NVMTLFunction *fn, NSArray *dylibs, NSEr
 // 26 that is the system's icon and Liquid Glass shaders: icons missing pieces, glass menus drawn as a flat tint.
 // The translator lists the references itself, so ask it. The known messages stay as a fallback for a translator
 // that cannot answer, so a query that cannot run never reads as "no references".
+// A function that calls through a visible or intersection function table. Most take the table as a kernel argument,
+// which the AIR marks with !"air.visible_function_table"; a DXR shim (Metal Shader Converter's IRDispatchRaysArgument,
+// Cyberpunk 2077's rgs_* kernels) loads the table out of an argument buffer instead, and only the call that takes a
+// function pointer out of it (@air.get_function_pointer_visible_function_table) or the ray intersection that takes the
+// intersection table tells. Translating such a function without its pipeline's linked functions refuses it ("pointer
+// nullness is not tracked for %N", the function pointer), and a nil MTLFunction aborts the app at its pipeline
+// (MTLComputePipelineDescriptor: "computeFunction must not be nil").
+BOOL nvmtl_air_uses_function_tables(NSString *air)
+{
+    return air.length && ([air rangeOfString:@"!\"air.visible_function_table\""].location != NSNotFound
+                       || [air rangeOfString:@"!\"air.intersection_function_table\""].location != NSNotFound
+                       || [air rangeOfString:@"@air.get_function_pointer_visible_function_table("].location != NSNotFound
+                       || [air rangeOfString:@"_intersection_function_table_t addrspace(1)* %"].location != NSNotFound);
+}
 BOOL nvmtl_needs_visible_link(NSString *air, NSString *why)
 {
+    if (nvmtl_air_uses_function_tables(air)) return YES;
     if (air.length && nvmtl_xlate_ready() && xlate_vrefs) {
         uint8_t *out = NULL; size_t len = 0; char e[256] = {0};
         if (xlate_vrefs(air.UTF8String, &out, &len, e, sizeof e) == 0) {
@@ -2295,8 +2357,7 @@ id<MTLFunction> nvmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, 
     const char **syms = calloc(n ? n : 1, sizeof *syms), **mls = calloc(n ? n : 1, sizeof *mls);
     if (!syms || !mls) { free(syms); free(mls); if (err) *err = nvmtl_link_err(@"link table allocation failed"); return nil; }
     for (size_t i = 0; i < n; i++) { syms[i] = [keys[i] UTF8String]; mls[i] = [mods[keys[i]] UTF8String]; }
-    BOOL usesTable = [fn->_air rangeOfString:@"!\"air.visible_function_table\""].location != NSNotFound
-                  || [fn->_air rangeOfString:@"!\"air.intersection_function_table\""].location != NSNotFound;
+    BOOL usesTable = nvmtl_air_uses_function_tables(fn->_air);
     id failKey = nvmtl_link_failure_key(fn, mods, usesTable ? (lf.functions ?: @[]) : @[], fc);
     NSString *known = [nvmtl_link_failures() objectForKey:failKey];
     if (known) {

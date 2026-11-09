@@ -585,8 +585,9 @@ fn emit_inline(
     let named = |i: usize| -> String { format!("{} {}", names[i].0, names[i].1) };
     declares.push(format!("declare ptr {}()", q("allocate")));
     declares.push(format!(
-        "declare void {}(ptr, <3 x float>, <3 x float>, float, float, ptr addrspace(1), i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)",
-        q("reset")
+        "declare void {}(ptr, <3 x float>, <3 x float>, float, float, {}, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i1, i1)",
+        q("reset"),
+        names[4].0
     ));
     declares.push(format!("declare i1 {}(ptr)", q("next")));
     declares.push(format!(
@@ -867,4 +868,99 @@ mod tests {
         let err = rewrite_runtime_intersection_tables(&k, "k", &[]).unwrap_err();
         assert!(err.contains("payload"), "{err}");
     }
+}
+
+
+/// An acceleration structure a kernel loads out of a buffer (Metal Shader Converter's DXR shim keeps it in
+/// top_level_global_ab) reaches `air.intersect` as a device pointer value the native emitter never materializes
+/// (device pointers live in its address network). The handle in memory is the structure's 64-bit device address
+/// (the plugin's gpuResourceID): the load becomes an i64 load whose value the intersect call takes directly
+/// (`i64 %x.m2v.addr`, which `emit_inline` passes to the query reset), and the ray query pass converts it with
+/// OpConvertUToAccelerationStructureKHR (`Structure::Value`). The pointer stays defined (inttoptr) for any other use.
+pub fn materialize_acceleration_structure_loads(ll: &str) -> String {
+    let mut operands: HashSet<String> = HashSet::default();
+    for line in ll.lines() {
+        let Some(call_at) = line.find("@air.intersect.") else { continue };
+        if !line.contains("call ") {
+            continue;
+        }
+        let Some(open) = line[call_at..].find('(').map(|e| call_at + e) else { continue };
+        let Some(close) = line.rfind(')') else { continue };
+        let args = split_top(&line[open + 1..close]);
+        if let Some(a) = args.get(4) {
+            if let Some(v) = a.split_whitespace().last() {
+                if v.starts_with('%') {
+                    operands.insert(v.to_string());
+                }
+            }
+        }
+    }
+    if operands.is_empty() {
+        return ll.to_string();
+    }
+    let addr_name = |res: &str| format!("%{}.m2v.addr", res.trim_start_matches('%'));
+    // the loads that define those operands (one per function that has one; names are function-local)
+    let mut loaded: HashSet<String> = HashSet::default();
+    let mut out = String::with_capacity(ll.len() + 1024);
+    for line in ll.lines() {
+        let trimmed = line.trim_start();
+        let indent = &line[..line.len() - trimmed.len()];
+        if let Some((res, rest)) = trimmed.split_once(" = load ") {
+            let res = res.trim();
+            if operands.contains(res) {
+                // typed: `T, T addrspace(K)* %p, align 8`   opaque: `ptr addrspace(1), ptr addrspace(K) %p, align 8`
+                let parts = split_top(rest);
+                if parts.len() >= 2 {
+                    let loaded_ty = parts[0].trim().to_string();
+                    let src = parts[1].trim();
+                    let Some(pct) = src.rfind('%') else { out.push_str(line); out.push('\n'); continue };
+                    let src_ty = src[..pct].trim();
+                    let src_val = &src[pct..];
+                    let tail = if parts.len() > 2 { format!(", {}", parts[2..].join(", ")) } else { String::new() };
+                    let addr = addr_name(res);
+                    if src_ty.starts_with("ptr") {
+                        out.push_str(&format!(
+                            "{indent}{addr} = load i64, {src_ty} {src_val}{tail}\n{indent}{res} = inttoptr i64 {addr} to {loaded_ty}\n"
+                        ));
+                    } else {
+                        let i64_ptr_ty = src_ty.rsplit_once(' ').map(|(_, aspace)| format!("i64 {aspace}")).unwrap_or_else(|| "i64 addrspace(1)*".into());
+                        let p = format!("{addr}.p");
+                        out.push_str(&format!(
+                            "{indent}{p} = bitcast {src_ty} {src_val} to {i64_ptr_ty}\n{indent}{addr} = load i64, {i64_ptr_ty} {p}{tail}\n{indent}{res} = inttoptr i64 {addr} to {loaded_ty}\n"
+                        ));
+                    }
+                    loaded.insert(res.to_string());
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if loaded.is_empty() {
+        return out;
+    }
+    // the intersect calls take the address value where its load was rewritten
+    let mut out2 = String::with_capacity(out.len());
+    for line in out.lines() {
+        if let Some(call_at) = line.find("@air.intersect.") {
+            if line.contains("call ") {
+                if let (Some(open), Some(close)) = (line[call_at..].find('(').map(|e| call_at + e), line.rfind(')')) {
+                    let mut args: Vec<String> = split_top(&line[open + 1..close]).into_iter().map(|a| a.to_string()).collect();
+                    if let Some(a) = args.get(4).cloned() {
+                        if let Some(v) = a.split_whitespace().last() {
+                            if loaded.contains(v) {
+                                args[4] = format!("i64 {}", addr_name(v));
+                                out2.push_str(&format!("{}({}){}\n", &line[..open], args.join(", "), &line[close..]));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out2.push_str(line);
+        out2.push('\n');
+    }
+    out2
 }

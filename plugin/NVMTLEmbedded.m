@@ -42,8 +42,51 @@ static id nvmtl_resid_lookup(uint64_t token)
     os_unfair_lock_unlock(&nvmtl_resid_lock);
     return resource;
 }
+id nvmtl_resid_resource(uint64_t token) { return nvmtl_resid_lookup(token); }   // diagnostic: the object behind a handle
+// Device loss: the textures whose image memory lies within 32 MB of the faulting VA (the handle map holds every
+// texture an argument buffer can reach), with what the plugin made of them
+void nvmtl_resid_dump_near(FILE *fp, uint64_t va)
+{
+    if (!fp || !va) return;
+    os_unfair_lock_lock(&nvmtl_resid_lock);
+    NSArray *objs = nvmtl_resid_map ? [[nvmtl_resid_map objectEnumerator] allObjects] : @[];
+    os_unfair_lock_unlock(&nvmtl_resid_lock);
+    fprintf(fp, "# textures with image memory within 32 MB of the fault VA 0x%llx (%lu handles):\n", (unsigned long long)va, (unsigned long)objs.count);
+    unsigned n = 0;
+    for (id o in objs) {
+        if (![o isKindOfClass:[NVMTLTexture class]]) continue;
+        NVMTLTexture *t = o, *root = t; while (root->_viewParent) root = root->_viewParent;
+        nvk_image *im = [t nvi]; if (!im || !im->img || !im->mem) continue;
+        uint64_t base = nvmtl_vk_memory_address(im->mem) + (root->_heap ? (uint64_t)root->_heapOffset : 0);
+        if (!base) continue;
+        int64_t d = (int64_t)va - (int64_t)base;
+        if (d < -(32 << 20) || d > (32 << 20)) continue;
+        fprintf(fp, "#   %s %p image %p mem VA 0x%llx (fault %+lld = +0x%llx) alloc 0x%zx placed %d: %ux%u layers %u mips %u vkfmt %u bpp %u mtl_type %u, metal fmt %lu usage 0x%lx, texture %lux%lux%lu type %lu\n",
+                t == root ? "texture" : "view", (__bridge void *)t, im->img, (unsigned long long)base, (long long)d, (unsigned long long)(d >= 0 ? (uint64_t)d : 0), im->alloc, im->placed,
+                im->w, im->h, im->layers, im->mips, im->fmt, im->bpp, im->mtl_type, (unsigned long)root->_fmt, (unsigned long)root->_usage,
+                (unsigned long)root.width, (unsigned long)root.height, (unsigned long)root.arrayLength, (unsigned long)root.textureType);
+        if (++n >= 40) break;
+    }
+}
 
-uint64_t nvmtl_resid_for_texture(id t) { return nvmtl_resid_assign(t, 0, nvmtl_vk_bindless_put([(NVMTLTexture *)t nvsampleview])); }
+uint64_t nvmtl_resid_for_texture(id t)
+{
+    NVMTLTexture *tx = (NVMTLTexture *)t; nvk_image *im = [tx nvi];
+    // the same slot serves the storage-image and texel-buffer bindings of the heap when the resource can be written or
+    // is a texture buffer (nvmtl_heap_write_full_locked); the identity view, not the swizzled one, for writes
+    // ... and only where the view's own format can be a storage image: an sRGB texture made writable through its UNORM
+    // views (VK_IMAGE_CREATE_EXTENDED_USAGE_BIT, nvmtl_vk.c) has no storage descriptor of its own, its UNORM views do
+    extern int nvmtl_pixfmt_public(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8);
+    uint32_t svk = 0, sbpp = 0; int sa8 = 0;
+    void *storageView = (im && im->storage && !nvmtl_pixfmt_public(tx->_fmt, &svk, &sbpp, &sa8) && nvmtl_vk_format_is_storage(svk)) ? [tx nvview] : NULL;
+    if (!storageView && (tx->_usage & (MTLTextureUsageShaderWrite | 0x20))) {
+        static _Atomic uint64_t n; const uint64_t k = atomic_fetch_add(&n, 1) + 1;
+        if (k <= 20 || !(k & (k - 1)))
+            nvlog("resid: texture %p fmt %lu %ux%u mips %u usage 0x%lx is shader-WRITABLE but its heap slot has NO storage descriptor (writes through its gpuResourceID land in the dummy) [%llu so far; image storage %d]",
+                  (__bridge void *)tx, (unsigned long)tx->_fmt, im ? im->w : 0, im ? im->h : 0, im ? im->mips : 0, (unsigned long)tx->_usage, (unsigned long long)k, im ? im->storage : -1);
+    }
+    return nvmtl_resid_assign(t, 0, nvmtl_vk_bindless_put_full([tx nvsampleview], storageView, tx->_tbView, tx->_tbStorage ? 1 : 0));
+}
 // A sampler's gpuResourceID carries its bindless heap slot in the low 32 bits (what a shader reading an argument buffer
 // indexes the sampler heap with) and a sequence number above them, so every sampler object keeps a unique token.
 uint64_t nvmtl_resid_for_sampler(id s)

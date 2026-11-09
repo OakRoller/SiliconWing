@@ -720,6 +720,10 @@ pub(super) fn requires_device_address_model(parsed: &LlModule) -> bool {
             };
             let consumes_address = call.callee == "mtl.force_not_checked.load.i64.p1"
                 || call.callee == "air.get_data_pointer_instance_acceleration_structure"
+                // an acceleration structure loaded out of a buffer (Metal Shader Converter's DXR shim keeps it in
+                // top_level_global_ab) is its 64-bit device address; the ray query pass converts the value
+                || call.callee.contains("_intersection_query.")
+                || call.callee.starts_with("air.intersect.")
                 || call.callee.starts_with("air.atomic.global")
                 || (!call.callee.starts_with("air.") && !call.callee.starts_with("llvm."));
             if consumes_address && call.args.iter().any(|arg| local_is(&arg.value, &addresses)) {

@@ -729,7 +729,12 @@ fn try_inline(
                 let new_body = if targets.is_some() && selected_pointer.is_none() {
                     f.body
                 } else {
-                    inline_body_to_fixpoint(f.body, &internal, &mut counter, selected_pointer)?
+                    // The caller's entry block is usually unlabelled; its implicit number is what phis below name
+                    // as the predecessor when a call in it is inlined (Cyberpunk's dithered-LOD irconverter shaders:
+                    // the layer loop's initial values stayed under the old label and the loop started from nothing).
+                    let entry = parse_def_header(&f.header)
+                        .and_then(|sig| implicit_entry_block_id(&sig.params, &f.body));
+                    inline_body_to_fixpoint(f.body, &internal, &mut counter, selected_pointer, entry.as_deref())?
                 };
                 out_items.push(Item::Func(FuncBlock {
                     header: f.header,
@@ -1008,13 +1013,14 @@ fn inline_body_to_fixpoint(
     internal: &HashMap<String, (DefSig, Vec<String>)>,
     counter: &mut usize,
     selected_pointer: Option<&str>,
+    entry_label: Option<&str>,
 ) -> Option<Vec<String>> {
     let mut budget = 100_000usize;
     loop {
         let Some(idx) = find_inlinable_call(&body, internal, selected_pointer) else {
             return Some(body);
         };
-        body = inline_one(body, idx, internal, counter, selected_pointer.is_some())?;
+        body = inline_one(body, idx, internal, counter, selected_pointer.is_some(), entry_label)?;
         budget -= 1;
         if budget == 0 {
             return None;
@@ -1046,6 +1052,7 @@ fn inline_one(
     internal: &HashMap<String, (DefSig, Vec<String>)>,
     counter: &mut usize,
     preserve_caller_cfg: bool,
+    caller_entry: Option<&str>,
 ) -> Option<Vec<String>> {
     let call = parse_call(&body[idx])?;
     let (sig, callee_body) = internal.get(&call.callee)?;
@@ -1137,7 +1144,7 @@ fn inline_one(
         renamed.push(rename_line(line, &value_map, &label_map));
     }
 
-    let bcall_label = enclosing_block_label(&body[..idx]);
+    let bcall_label = enclosing_block_label(&body[..idx]).or_else(|| caller_entry.map(|s| s.to_string()));
     // The call's block ends in the continuation block now, so every edge it had leaves from there: phis naming it as a
     // predecessor are relabelled wherever they are, including loop headers above the call (a loop whose body was a
     // call kept its back-edge value under the old label, the emitter dropped it, and the loop never advanced: Blender
@@ -2184,6 +2191,8 @@ pub(crate) fn inline_and_forward_object_fields(san_ll: &str) -> Option<String> {
 /// two-way branch is the shape it already merges. A case target opening with a phi keeps its switch (the phi has one entry
 /// per case edge), and so does a phi default when the chain would move its edge to a new block.
 fn fold_switches_to_branches_in(f: &mut FuncBlock) -> bool {
+    // A switch in the unlabelled entry block: its phis name the block by its implicit number, not by "entry".
+    let implicit_entry = parse_def_header(&f.header).and_then(|sig| implicit_entry_block_id(&sig.params, &f.body));
     let target_has_phi = |body: &[String], target: &str| {
         let Some(at) = body.iter().position(|l| block_label_id(l) == Some(target)) else { return true };
         body[at + 1..].iter().map(|l| l.trim()).find(|l| !l.is_empty() && !l.starts_with(';')).is_some_and(|l| l.contains(" = phi "))
@@ -2233,7 +2242,10 @@ fn fold_switches_to_branches_in(f: &mut FuncBlock) -> bool {
             .iter()
             .rev()
             .find_map(|l| block_label_id(l).map(str::to_string))
-            .or_else(|| (!f.body[..i].iter().any(|l| block_label_id(l).is_some())).then(|| "entry".to_string()));
+            .or_else(|| {
+                (!f.body[..i].iter().any(|l| block_label_id(l).is_some()))
+                    .then(|| implicit_entry.clone().unwrap_or_else(|| "entry".to_string()))
+            });
         let default_phi_edge = groups.len() > 1 && target_has_phi(&f.body, &default);
         if default_phi_edge && switch_block.is_none() {
             i = end + 1;

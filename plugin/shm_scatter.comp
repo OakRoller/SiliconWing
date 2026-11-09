@@ -1,0 +1,26 @@
+// shmirror scatter upload (notes item 83, NVMTL_SHM_SCATTER): run at the head of a part, in its prologue on the graphics
+// queue, so it is ordered after every earlier part - writer parts and their copy-backs included - and needs no wait.
+// One workgroup per list entry: copy <words> 32-bit words from the system pages (src) to the VRAM copy (dst).
+// List entry (32 bytes): u64 src, u64 dst, u32 words, u32 pad, u64 pad.
+// Build: glslangValidator --target-env vulkan1.2 -V shm_scatter.comp --vn shm_scatter_spv -o shm_scatter.spv.h
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer V4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Ent { uint64_t src, dst; uint words, pad0; uint64_t pad1; };
+layout(push_constant) uniform PC { uint64_t list; uint count; uint pad; } pc;
+void main() {
+    const uint i = gl_WorkGroupID.x;
+    if (i >= pc.count) return;
+    Ent E = Ent(pc.list + uint64_t(i) * 32ul);
+    const uint64_t s = E.src, d = E.dst; const uint n = E.words;
+    if (((s | d) & 15ul) == 0ul && (n & 3u) == 0u) {   // 16-byte aligned: uvec4 copies
+        V4 S = V4(s), D = V4(d);
+        for (uint k = gl_LocalInvocationID.x; k < (n >> 2); k += 64u) D.v[k] = S.v[k];
+    } else {
+        U32 S = U32(s), D = U32(d);
+        for (uint k = gl_LocalInvocationID.x; k < n; k += 64u) D.v[k] = S.v[k];
+    }
+}
