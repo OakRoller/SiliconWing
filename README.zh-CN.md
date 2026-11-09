@@ -80,10 +80,9 @@ Apple Silicon 游戏默认 CPU 和 GPU 共用同一块内存，可隔着线缆�
 - 先备份。安装会修改 Mac 的启动安全策略（改为"宽松安全性"、关闭 SIP）。这些改动可以撤销，但只能在恢复模式里撤销。
 - 退出并停用其他会驱动这块显卡的软件（例如 TinyGPU / tinygrad 的驱动扩展：系统设置 → 通用 → 登录项与扩展 →
   驱动程序扩展，把它关掉）。两个驱动同时操作一张卡会导致 Mac 死机。
-- 解压安装包（会解压出一个名为 `package-arm64` 的文件夹），把它移到**路径中没有空格**的位置。本页假定放在
-  `~/Desktop/siliconwing/`：
-  `mv ~/Downloads/package-arm64 ~/Desktop/siliconwing`。然后清除下载隔离标记，否则里面的工具无法运行：
-  `xattr -dr com.apple.quarantine ~/Desktop/siliconwing`。
+- 解压安装包，会得到一个名为 `package-arm64` 的文件夹。可以改名，放在任何**路径中没有空格**的位置。在**这个文件夹里**
+  打开终端——本页所有命令都在这里执行（在访达里右键点该文件夹 → 新建位于文件夹位置的终端窗口）。然后清除下载隔离标记，
+  否则里面的工具无法运行：`xattr -dr com.apple.quarantine .`
 - 趁还在 macOS 里，先记下**卷组 UUID**（第 1 步要用）：`diskutil info / | grep "Volume Group"`。
 
 ## 1. 允许第三方内核扩展（恢复模式）
@@ -116,11 +115,7 @@ sudo nvram boot-args="amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_opti
 
 ## 3. 安装
 
-登录之后再插上显卡盒，然后执行：
-
-```bash
-cd ~/Desktop/siliconwing
-```
+登录之后再插上显卡盒，然后在安装包文件夹里执行：
 
 ```bash
 sudo CHECK=1 bash install.sh
@@ -166,7 +161,7 @@ macOS 会把内置 GPU 作为"系统默认"设备交给每个应用。安装包�
 **任意应用或游戏：**
 
 ```bash
-~/Desktop/siliconwing/launch/usenv.sh "/Applications/Some Game.app"
+launch/usenv.sh "/Applications/Some Game.app"
 ```
 
 应用路径后面的参数会原样传给游戏。
@@ -174,13 +169,19 @@ macOS 会把内置 GPU 作为"系统默认"设备交给每个应用。安装包�
 **Steam 游戏：**先打开 Steam 客户端，再在后面加上游戏的 Steam 应用 ID（就是 `steamapps/appmanifest_<ID>.acf` 里的数字）：
 
 ```bash
-~/Desktop/siliconwing/launch/usenv.sh "$HOME/Library/Application Support/Steam/steamapps/common/Cyberpunk 2077/Cyberpunk2077.app" 1091500
+launch/usenv.sh "$HOME/Library/Application Support/Steam/steamapps/common/Cyberpunk 2077/Cyberpunk2077.app" 1091500
 ```
 
 如果想照常从 Steam 库里启动，可以把游戏的**启动选项**（属性 → 通用）设为：
 
 ```
-DYLD_INSERT_LIBRARIES=/Users/<你的用户名>/Desktop/siliconwing/launch/libusenv.dylib %command%
+DYLD_INSERT_LIBRARIES=<安装包文件夹>/launch/libusenv.dylib %command%
+```
+
+这里 Steam 需要完整路径。在安装包文件夹里运行下面这条命令，把它输出的路径粘贴进去：
+
+```bash
+echo "$PWD/launch/libusenv.dylib"
 ```
 
 **怎么确认成功：**终端会打印 `usenv: default Metal device -> NVIDIA GeForce …`。如果显示 `NVMTLDevice NOT found`，
@@ -205,7 +206,7 @@ DYLD_INSERT_LIBRARIES=/Users/<你的用户名>/Desktop/siliconwing/launch/libuse
 示例——关闭共享内存加速来运行游戏：
 
 ```bash
-NVMTL_SHMIRROR=0 ~/Desktop/siliconwing/launch/usenv.sh "/Applications/Some Game.app"
+NVMTL_SHMIRROR=0 launch/usenv.sh "/Applications/Some Game.app"
 ```
 
 ## 7. 已知问题
@@ -227,9 +228,7 @@ NVMTL_SHMIRROR=0 ~/Desktop/siliconwing/launch/usenv.sh "/Applications/Some Game.
 
 ## 9. 卸载
 
-```bash
-cd ~/Desktop/siliconwing
-```
+在安装包文件夹里执行：
 
 ```bash
 sudo bash uninstall.sh

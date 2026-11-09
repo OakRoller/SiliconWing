@@ -4,11 +4,10 @@
 **What this changes**
 
 
-**How I tested it** (card, macOS version, what you ran or did)
+**How I tested it** (Mac and chip, macOS version, enclosure, card, what you ran)
 
 
 Fixes #
 
-- [ ] I wrote this change and this description myself (not an AI tool), and I can explain every line.
-
-<!-- Please read CONTRIBUTING.md. AI-written pull requests are closed without review. -->
+- [ ] Tested on real hardware (not only built)
+- [ ] AI helped with this change (fine - just say so)

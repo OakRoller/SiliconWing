@@ -1,17 +1,26 @@
-name: It works on my machine
-description: Tell us a machine that reached the desktop, so 1401 sets it up the same way for everyone with it.
-title: "[Works] <CPU> + <GPU> + <board or laptop>"
+name: It works on my Mac
+description: Tell us a Mac, enclosure and card that work - every new combination helps.
+title: "[Works] <Mac> + <card>"
 labels: [works]
 body:
   - type: input
-    id: report
+    id: mac
     attributes:
-      label: Send logs report ID from the working Mac
-      placeholder: NM-
+      label: Mac and macOS
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: Enclosure and card
     validations:
       required: true
   - type: textarea
+    id: games
+    attributes:
+      label: What you ran, and how fast
+      description: Games or apps, settings, frame rates - and the same on the built-in GPU if you measured it.
+  - type: textarea
     id: notes
     attributes:
-      label: Anything you had to do that 1401 did not do for you
-      description: BIOS settings, boot-args, kexts. This is what we build into 1401 next.
+      label: Anything you had to do differently from the README

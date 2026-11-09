@@ -90,10 +90,10 @@ been tested on one machine. Read the whole page before installing.
   only from recoveryOS.
 - Quit and disable anything else that drives the card (TinyGPU / tinygrad's driver extension: System Settings →
   General → Login Items & Extensions → Driver Extensions, switch it off). Two drivers on one card will crash the Mac.
-- Unzip the package (it unpacks to a folder named `package-arm64`) and move it to a path **without spaces**; this
-  page assumes `~/Desktop/siliconwing/`:
-  `mv ~/Downloads/package-arm64 ~/Desktop/siliconwing`. Then clear the
-  download quarantine so its tools can run: `xattr -dr com.apple.quarantine ~/Desktop/siliconwing`.
+- Unzip the package. It unpacks to a folder named `package-arm64`; keep it (renamed if you like) anywhere whose path
+  has **no spaces**. Open Terminal **in that folder** - every command on this page is run from there (in Finder:
+  right-click the folder → New Terminal at Folder). Then clear the download quarantine so its tools can run:
+  `xattr -dr com.apple.quarantine .`
 - Note your **volume group UUID** while still in macOS — step 1 needs it: `diskutil info / | grep "Volume Group"`.
 
 ## 1. Allow third-party kernel extensions (recoveryOS)
@@ -128,11 +128,7 @@ setup has proven stable. Restart for boot-args to take effect.
 
 ## 3. Install
 
-Plug the enclosure in after you have logged in, then:
-
-```bash
-cd ~/Desktop/siliconwing
-```
+Plug the enclosure in after you have logged in, then, in the package folder:
 
 ```bash
 sudo CHECK=1 bash install.sh
@@ -181,7 +177,7 @@ device for that process only.
 **Any app or game:**
 
 ```bash
-~/Desktop/siliconwing/launch/usenv.sh "/Applications/Some Game.app"
+launch/usenv.sh "/Applications/Some Game.app"
 ```
 
 Arguments after the app path go to the game.
@@ -190,13 +186,19 @@ Arguments after the app path go to the game.
 `steamapps/appmanifest_<id>.acf`):
 
 ```bash
-~/Desktop/siliconwing/launch/usenv.sh "$HOME/Library/Application Support/Steam/steamapps/common/Cyberpunk 2077/Cyberpunk2077.app" 1091500
+launch/usenv.sh "$HOME/Library/Application Support/Steam/steamapps/common/Cyberpunk 2077/Cyberpunk2077.app" 1091500
 ```
 
 Or, to launch from the Steam library as usual, set the game's **Launch Options** (Properties → General) to:
 
 ```
-DYLD_INSERT_LIBRARIES=/Users/<you>/Desktop/siliconwing/launch/libusenv.dylib %command%
+DYLD_INSERT_LIBRARIES=<package folder>/launch/libusenv.dylib %command%
+```
+
+Steam needs the full path there. To print it, run this in the package folder and paste what it shows:
+
+```bash
+echo "$PWD/launch/libusenv.dylib"
 ```
 
 **How to tell it worked:** the terminal prints `usenv: default Metal device -> NVIDIA GeForce …`. If it says
@@ -222,7 +224,7 @@ launch options before `%command%`).
 Example — run a game with the shared-memory acceleration off:
 
 ```bash
-NVMTL_SHMIRROR=0 ~/Desktop/siliconwing/launch/usenv.sh "/Applications/Some Game.app"
+NVMTL_SHMIRROR=0 launch/usenv.sh "/Applications/Some Game.app"
 ```
 
 ## 7. Known issues
@@ -247,9 +249,7 @@ NVMTL_SHMIRROR=0 ~/Desktop/siliconwing/launch/usenv.sh "/Applications/Some Game.
 
 ## 9. Uninstall
 
-```bash
-cd ~/Desktop/siliconwing
-```
+In the package folder:
 
 ```bash
 sudo bash uninstall.sh

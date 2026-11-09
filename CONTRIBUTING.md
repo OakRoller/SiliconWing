@@ -1,47 +1,50 @@
 # Contributing
 
-Bug reports and pull requests are welcome. Please read this first; it keeps the queue small enough that every PR
-gets a real review.
+Bug reports, test reports and pull requests are welcome. SiliconWing has been tested on one Mac with one card, so a
+report from your machine - working or not - is one of the most useful things you can send.
 
 ## Reporting a bug
 
-1. Press Send logs in the 1401 app (Windows or Mac). It gives you a report ID like `NM-ABCD1234`.
-2. Open an issue with the bug form and put the report ID in it.
-3. Describe what you see in a few sentences of your own. The logs are in the report, so don't paste them in.
+Open an issue with the bug form and include:
+
+1. Your Mac (model and chip), macOS version, Thunderbolt enclosure and NVIDIA card.
+2. The package version (`VERSION` in the package folder).
+3. What you did and what you saw, in a few sentences.
+4. The driver log (`/tmp/nvmtl.log`, `$TMPDIR/nvmtl.log`, or your `NVMTL_LOG_PATH`) as an attachment, and the panic report
+   from `/Library/Logs/DiagnosticReports/` if the Mac restarted.
 
 One problem per issue. If you found the cause, say how you know: what you ran and what it printed.
 
-## No AI-written contributions
+## AI-assisted contributions
 
-Pull requests, issues and review comments must be written by a person who understands them. AI-written code,
-descriptions and bug reports are closed without review.
+Welcome. Use whatever tools help you, as long as:
+
+- the change was tested on real hardware, and the pull request says how (Mac, card, what you ran);
+- you say in the pull request that AI helped;
+- you can answer review questions about it.
+
+Untested generated code and long generated descriptions are hard to review and will be sent back.
 
 ## Pull requests
 
-- Write it yourself and understand it. You have to be able to explain every line and answer review questions about
-  it. PRs that are pasted tool output (long generated descriptions, "say the word and I will add it", changes the
-  author can't explain) are closed without review.
-- One change per PR. A fix, a feature or a cleanup, not all three. Small PRs get merged; 2,000-line PRs sit.
-- Say what you tested. Your card, macOS version, and what you did to check it. "Builds" is not tested.
+- One change per PR: a fix, a feature or a cleanup, not all three. Small PRs get merged.
+- Say what you tested: Mac, card, macOS version, and what you ran. "Builds" is not tested.
 - Keep the description short: what was wrong, what you changed, how you tested it. Link the issue.
-- Commit messages: `component: short summary` under 72 characters (`NVRMFB: fix 165 Hz mode missing`), then a
-  plain explanation if one is needed.
-- Comments in code explain why the code does what it does. They are not a log of when you found something.
-
-Kernel changes (`kexts/`) need a boot on real hardware before they can be merged, because a bad kext stops the
-machine from starting. Say which card you booted it on.
+- Commit messages: `component: short summary` under 72 characters, then a plain explanation if needed.
+- Comments in code explain why the code does what it does.
+- Kernel changes (`kexts/`) need a boot on real hardware before they can be merged. Say which Mac and card.
 
 ## Where help is needed
 
-See the issues labelled `help wanted`. The areas with the most open problems:
-
-- Turing (GTX 16, RTX 20): flicker and black screens on cards with a small BAR.
-- Display: ultrawide and high refresh rate modes, hot-plugging a monitor.
-- Video: hardware decode in sandboxed processes (Chrome, Photos).
-- Laptops: machines where the screen is wired to the Intel GPU.
-
-If you own a card we haven't tested, a working report (the "It works" form) is as useful as code.
+- Other Macs: M1/M2/M3/M4 in every variant; Thunderbolt 4/5 and USB4 enclosures.
+- Other cards: RTX 20, RTX 40 and RTX 50 have not been tried on Apple Silicon.
+- Games: which ones run, which don't, and how fast.
+- Performance at low resolutions (see `docs/ARM64-PORT-NOTES.md`, items 87-91).
 
 ## Building
 
-See [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) for the layout of the source and how each part is built.
+`build/arm64/rebuild_all.sh` builds everything; `build/arm64/package.sh` assembles the installer package in
+`out/package-arm64`. `docs/ARM64-PORT-NOTES.md` has the details and `docs/HOW-IT-WORKS.md` the layout of the source.
+
+Problems that also happen on Intel Macs or OpenCore PCs belong to the original driver:
+https://github.com/nullmoth/nvidia-macos-driver
